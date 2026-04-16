@@ -1582,7 +1582,7 @@ class Sadie_Publisher {
         $host = strtolower($parsed['host'] ?? '');
         $trusted = false;
         foreach (self::$trusted_update_domains as $domain) {
-            if ($host === $domain || str_ends_with($host, '.' . $domain)) {
+            if ($host === $domain || substr($host, -strlen('.' . $domain)) === '.' . $domain) {
                 $trusted = true;
                 break;
             }
@@ -1594,7 +1594,7 @@ class Sadie_Publisher {
 
         // --- Validation 4: URL path must end in .zip ---
         $path = $parsed['path'] ?? '';
-        if (!str_ends_with(strtolower($path), '.zip')) {
+        if (substr(strtolower($path), -4) !== '.zip') {
             $this->audit_log('self_update', false, $ip, 'URL does not point to a .zip file');
             return new WP_Error('bad_request', 'zip_url must point to a .zip file.', ['status' => 400]);
         }
@@ -1646,7 +1646,7 @@ class Sadie_Publisher {
             $entry = $zip->getNameIndex($i);
 
             // Skip directories and macOS resource forks
-            if (str_ends_with($entry, '/') || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
+            if (substr($entry, -1) === '/' || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
                 continue;
             }
 
