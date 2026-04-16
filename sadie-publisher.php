@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: One-way content publishing from Sadie Blog Command Center to WordPress. Security-hardened, builder-aware.
- * Version: 2.3.0
+ * Version: 2.0.2
  * Author: Sadie SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,10 +11,7 @@
  * Requires at least: 5.8
  *
  * Changelog:
- * 2.3.0 - Elementor data read/write support in update endpoint, GET post-data endpoint
- * 2.2.1 - Heartbeat now reports scheduled (future) post count
- * 2.2.0 - Secure self-update endpoint, date/scheduling support in create+update, version bump
- * 2.1.0 - Category support in updates, version bump for clean upgrade path
+ * 2.0.2 - WP Options read/write endpoint for remote plugin configuration
  * 2.0.1 - Auto-sideload external images in post content to local media library
  * 2.0.0 - Major security hardening, builder detection, heartbeat monitoring, one-way design
  * 1.0.2 - Fixed API key being cleared when saving settings
@@ -26,7 +23,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '2.3.0');
+define('SADIE_PUBLISHER_VERSION', '2.0.2');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -409,13 +406,6 @@ class Sadie_Publisher {
             'permission_callback' => [$this, 'verify_request'],
         ]);
 
-        // Get post data (content, elementor_data, meta)
-        register_rest_route($ns, '/post-data/(?P<id>\d+)', [
-            'methods' => 'GET',
-            'callback' => [$this, 'handle_get_post_data'],
-            'permission_callback' => [$this, 'verify_request'],
-        ]);
-
         // Connection test
         register_rest_route($ns, '/ping', [
             'methods' => 'GET',
@@ -444,10 +434,15 @@ class Sadie_Publisher {
             'permission_callback' => [$this, 'verify_request'],
         ]);
 
-        // Self-update (secure remote plugin update)
-        register_rest_route($ns, '/self-update', [
+        // WP options read (GET) and write (POST)
+        register_rest_route($ns, '/options', [
+            'methods' => 'GET',
+            'callback' => [$this, 'handle_options_get'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+        register_rest_route($ns, '/options', [
             'methods' => 'POST',
-            'callback' => [$this, 'handle_self_update'],
+            'callback' => [$this, 'handle_options_set'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
     }
@@ -542,6 +537,62 @@ class Sadie_Publisher {
 
         return true;
     }
+
+    // =========================================================================
+    // ENDPOINT: WP OPTIONS READ/WRITE
+    // =========================================================================
+
+    public function handle_options_get($request) {
+        $ip = $this->get_client_ip();
+        $keys = $request->get_param('keys');
+        if (empty($keys) || !is_array($keys)) {
+            return new WP_Error('bad_request', 'keys[] parameter required.', ['status' => 400]);
+        }
+        $result = [];
+        foreach ($keys as $key) {
+            $key = sanitize_key($key);
+            if ($key) {
+                $result[$key] = get_option($key);
+            }
+        }
+        $this->audit_log('options_get', true, $ip, implode(',', array_keys($result)));
+        return new WP_REST_Response($result, 200);
+    }
+
+    public function handle_options_set($request) {
+        $ip = $this->get_client_ip();
+        $params = $request->get_json_params();
+        $options = $params['options'] ?? null;
+        if (empty($options) || !is_array($options)) {
+            return new WP_Error('bad_request', 'options object required.', ['status' => 400]);
+        }
+        $updated = [];
+        $failed  = [];
+        foreach ($options as $key => $value) {
+            $key = sanitize_key($key);
+            if (!$key) continue;
+            $ok = update_option($key, $value);
+            if ($ok) {
+                $updated[] = $key;
+            } else {
+                $current = get_option($key);
+                if ($current == $value) {
+                    $updated[] = $key;
+                } else {
+                    $failed[] = $key;
+                }
+            }
+        }
+        $this->audit_log('options_set', empty($failed), $ip, implode(',', $updated));
+        return new WP_REST_Response([
+            'updated' => $updated,
+            'failed'  => $failed,
+        ], 200);
+    }
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
 
     private function get_client_ip() {
         // Only trust direct connection IP — don't trust forwarded headers to prevent spoofing
@@ -825,7 +876,6 @@ class Sadie_Publisher {
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
                 'pending' => $post_counts->pending ?? 0,
-                'scheduled' => $post_counts->future ?? 0,
                 'total_sadie' => $this->count_sadie_posts(),
             ],
             'last_publish' => [
@@ -1012,22 +1062,11 @@ class Sadie_Publisher {
                 $post_data['post_status'] = $params['status'];
             }
         }
-        if (!empty($params['date'])) {
-            $post_data['post_date'] = sanitize_text_field($params['date']);
-            if (($post_data['post_status'] ?? '') === 'future') {
-                $post_data['post_date_gmt'] = get_gmt_from_date($params['date']);
-            }
-        }
         if (!empty($params['slug'])) {
             $post_data['post_name'] = sanitize_title($params['slug']);
         }
         if (!empty($params['excerpt'])) {
             $post_data['post_excerpt'] = sanitize_textarea_field($params['excerpt']);
-        }
-
-        // WordPress requires edit_date=true to actually change post_date on updates
-        if (!empty($params['date'])) {
-            $post_data['edit_date'] = true;
         }
 
         $result = wp_update_post($post_data, true);
@@ -1061,28 +1100,6 @@ class Sadie_Publisher {
             $this->sideload_content_images($post_id);
         }
 
-        // Update categories if provided
-        if (!empty($params['categories'])) {
-            $this->assign_categories($post_id, $params['categories']);
-        }
-
-        // Update Elementor data if provided (allows direct editing of Elementor JSON)
-        if (!empty($params['elementor_data'])) {
-            $elementor_data = $params['elementor_data'];
-            // Accept either a JSON string or already-decoded array
-            if (is_string($elementor_data)) {
-                $decoded = json_decode($elementor_data, true);
-                if (json_last_error() === JSON_ERROR_NONE) {
-                    $elementor_data = $decoded;
-                }
-            }
-            if (is_array($elementor_data)) {
-                update_post_meta($post_id, '_elementor_data', wp_slash(wp_json_encode($elementor_data)));
-                // Ensure Elementor knows this post uses its builder
-                update_post_meta($post_id, '_elementor_edit_mode', 'builder');
-            }
-        }
-
         update_post_meta($post_id, '_sadie_updated_at', current_time('mysql'));
 
         $this->audit_log('update', true, $ip, "Post #{$post_id}");
@@ -1092,37 +1109,6 @@ class Sadie_Publisher {
             'post_id' => $post_id,
             'post_url' => get_permalink($post_id),
             'status' => get_post_status($post_id),
-        ], 200);
-    }
-
-    // =========================================================================
-    // ENDPOINT: GET POST DATA (content, elementor_data, post_content)
-    // =========================================================================
-
-    public function handle_get_post_data($request) {
-        $post_id = absint($request->get_param('id'));
-        $post = get_post($post_id);
-        if (!$post) {
-            return new WP_Error('not_found', 'Post not found.', ['status' => 404]);
-        }
-
-        $elementor_raw = get_post_meta($post_id, '_elementor_data', true);
-        $elementor_data = null;
-        if (!empty($elementor_raw)) {
-            $decoded = json_decode($elementor_raw, true);
-            if (json_last_error() === JSON_ERROR_NONE) {
-                $elementor_data = $decoded;
-            }
-        }
-
-        return new WP_REST_Response([
-            'success'        => true,
-            'post_id'        => $post_id,
-            'post_title'     => $post->post_title,
-            'post_status'    => $post->post_status,
-            'post_content'   => $post->post_content,
-            'elementor_data' => $elementor_data,
-            'elementor_mode' => get_post_meta($post_id, '_elementor_edit_mode', true),
         ], 200);
     }
 
@@ -1528,265 +1514,6 @@ class Sadie_Publisher {
         }
 
         return $attachment_id;
-    }
-
-    // =========================================================================
-    // SELF-UPDATE: SECURE REMOTE PLUGIN UPDATE
-    // =========================================================================
-
-    /**
-     * Trusted domains that can host plugin update ZIPs.
-     * HARDCODED — cannot be overridden via API or wp_options.
-     */
-    private static $trusted_update_domains = [
-        'rfxzwdbuwccytyepjwwn.supabase.co',
-        'github.com',
-        'raw.githubusercontent.com',
-        'objects.githubusercontent.com',
-    ];
-
-    /**
-     * Handle self-update request.
-     *
-     * Security layers:
-     * 1. Full HMAC-authenticated request (via verify_request)
-     * 2. ZIP URL must be from hardcoded trusted domain list
-     * 3. ZIP URL must use HTTPS
-     * 4. Downloaded via WordPress HTTP API (respects proxy/SSL settings)
-     * 5. ZIP contents validated: must contain exactly sadie-publisher.php
-     * 6. PHP file validated: must have correct Plugin Name header
-     * 7. PHP file scanned for dangerous functions (eval, exec, system, etc.)
-     * 8. Backup created before replacement
-     * 9. Uses WP_Filesystem — no raw file operations
-     * 10. Full audit logging of every step
-     */
-    public function handle_self_update($request) {
-        $ip = $this->get_client_ip();
-        $params = $request->get_json_params();
-        $zip_url = $params['zip_url'] ?? '';
-
-        // --- Validation 1: URL present and well-formed ---
-        if (empty($zip_url) || !filter_var($zip_url, FILTER_VALIDATE_URL)) {
-            $this->audit_log('self_update', false, $ip, 'Missing or invalid zip_url');
-            return new WP_Error('bad_request', 'Valid zip_url is required.', ['status' => 400]);
-        }
-
-        // --- Validation 2: HTTPS only ---
-        if (strpos($zip_url, 'https://') !== 0) {
-            $this->audit_log('self_update', false, $ip, 'Non-HTTPS zip_url rejected');
-            return new WP_Error('bad_request', 'zip_url must use HTTPS.', ['status' => 400]);
-        }
-
-        // --- Validation 3: Trusted domain only ---
-        $parsed = wp_parse_url($zip_url);
-        $host = strtolower($parsed['host'] ?? '');
-        $trusted = false;
-        foreach (self::$trusted_update_domains as $domain) {
-            if ($host === $domain || substr($host, -strlen('.' . $domain)) === '.' . $domain) {
-                $trusted = true;
-                break;
-            }
-        }
-        if (!$trusted) {
-            $this->audit_log('self_update', false, $ip, "Untrusted domain: {$host}");
-            return new WP_Error('forbidden', 'zip_url domain is not trusted.', ['status' => 403]);
-        }
-
-        // --- Validation 4: URL path must end in .zip ---
-        $path = $parsed['path'] ?? '';
-        if (substr(strtolower($path), -4) !== '.zip') {
-            $this->audit_log('self_update', false, $ip, 'URL does not point to a .zip file');
-            return new WP_Error('bad_request', 'zip_url must point to a .zip file.', ['status' => 400]);
-        }
-
-        $this->audit_log('self_update', true, $ip, "Update initiated from {$host}");
-
-        // --- Download ZIP ---
-        $tmp_file = download_url($zip_url, 30);
-        if (is_wp_error($tmp_file)) {
-            $this->audit_log('self_update', false, $ip, 'Download failed: ' . $tmp_file->get_error_message());
-            return new WP_Error('download_failed', 'Failed to download update package.', ['status' => 502]);
-        }
-
-        // --- Validate ZIP size (max 2MB — plugin should never be larger) ---
-        $file_size = filesize($tmp_file);
-        if ($file_size > 2 * 1024 * 1024) {
-            @unlink($tmp_file);
-            $this->audit_log('self_update', false, $ip, "ZIP too large: {$file_size} bytes");
-            return new WP_Error('bad_request', 'Update package exceeds 2MB limit.', ['status' => 400]);
-        }
-
-        // --- Extract and validate ZIP contents ---
-        $result = $this->validate_and_apply_update($tmp_file, $ip);
-        @unlink($tmp_file);
-
-        if (is_wp_error($result)) {
-            return $result;
-        }
-
-        return new WP_REST_Response($result, 200);
-    }
-
-    /**
-     * Validate ZIP contents and apply the update.
-     */
-    private function validate_and_apply_update($zip_path, $ip) {
-        $zip = new ZipArchive();
-        $open_result = $zip->open($zip_path, ZipArchive::RDONLY);
-        if ($open_result !== true) {
-            $this->audit_log('self_update', false, $ip, 'Invalid ZIP archive');
-            return new WP_Error('bad_request', 'Invalid ZIP archive.', ['status' => 400]);
-        }
-
-        // --- Validation 5: ZIP must contain exactly one PHP file: sadie-publisher.php ---
-        $valid_entries = [];
-        $has_plugin_file = false;
-
-        for ($i = 0; $i < $zip->numFiles; $i++) {
-            $entry = $zip->getNameIndex($i);
-
-            // Skip directories and macOS resource forks
-            if (substr($entry, -1) === '/' || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
-                continue;
-            }
-
-            // Normalize: strip leading folder if ZIP was created with a wrapper dir
-            $basename = basename($entry);
-
-            // Block path traversal attempts
-            if (strpos($entry, '..') !== false || strpos($entry, '\\') !== false) {
-                $zip->close();
-                $this->audit_log('self_update', false, $ip, "Path traversal attempt: {$entry}");
-                return new WP_Error('forbidden', 'Invalid file path in archive.', ['status' => 403]);
-            }
-
-            // Only allow the main plugin PHP file
-            if ($basename === 'sadie-publisher.php') {
-                $has_plugin_file = true;
-                $valid_entries[] = $entry;
-            } else {
-                // Reject any unexpected files
-                $zip->close();
-                $this->audit_log('self_update', false, $ip, "Unexpected file in ZIP: {$entry}");
-                return new WP_Error('bad_request', "Unexpected file in archive: {$basename}", ['status' => 400]);
-            }
-        }
-
-        if (!$has_plugin_file) {
-            $zip->close();
-            $this->audit_log('self_update', false, $ip, 'ZIP missing sadie-publisher.php');
-            return new WP_Error('bad_request', 'Archive must contain sadie-publisher.php.', ['status' => 400]);
-        }
-
-        // --- Read the plugin file content from ZIP ---
-        $new_plugin_content = $zip->getFromName($valid_entries[0]);
-        $zip->close();
-
-        if ($new_plugin_content === false || strlen($new_plugin_content) < 100) {
-            $this->audit_log('self_update', false, $ip, 'Could not read plugin file from ZIP or file too small');
-            return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
-        }
-
-        // --- Validation 6: Must have valid WordPress plugin header ---
-        if (strpos($new_plugin_content, 'Plugin Name: Sadie Publisher') === false) {
-            $this->audit_log('self_update', false, $ip, 'Missing or wrong Plugin Name header');
-            return new WP_Error('bad_request', 'Plugin file missing valid "Plugin Name: Sadie Publisher" header.', ['status' => 400]);
-        }
-
-        // --- Validation 7: Must start with <?php ---
-        $trimmed = ltrim($new_plugin_content);
-        if (strpos($trimmed, '<?php') !== 0) {
-            $this->audit_log('self_update', false, $ip, 'File does not start with <?php');
-            return new WP_Error('bad_request', 'Plugin file must start with <?php.', ['status' => 400]);
-        }
-
-        // --- Validation 8: Scan for dangerous PHP functions ---
-        // Dangerous function names — scanner builds regex dynamically to avoid
-        // the pattern definitions themselves triggering a match during self-update.
-        $dangerous_funcs = [
-            'ev' . 'al',
-            'ex' . 'ec',
-            'sys' . 'tem',
-            'passth' . 'ru',
-            'shell_ex' . 'ec',
-            'pop' . 'en',
-            'proc_op' . 'en',
-            'pcntl_ex' . 'ec',
-            'ass' . 'ert',
-            'create_func' . 'tion',
-            'base64_dec' . 'ode',
-            'gzinfl' . 'ate',
-            'str_rot' . '13',
-            'curl_ex' . 'ec',
-            'phpin' . 'fo',
-        ];
-
-        foreach ($dangerous_funcs as $func) {
-            // Word-boundary match: function name followed by optional whitespace and (
-            $regex = '/(?<!\w)' . preg_quote($func, '/') . '\s*\(/i';
-            if (preg_match($regex, $new_plugin_content)) {
-                $this->audit_log('self_update', false, $ip, "Dangerous pattern detected: {$func}()");
-                return new WP_Error('forbidden', "Plugin file contains forbidden pattern: {$func}()", ['status' => 403]);
-            }
-        }
-
-        // Also check for remote file inclusion via file_get_contents
-        if (preg_match('/file_get_conte' . 'nts\s*\(\s*[\'"]https?:/i', $new_plugin_content)) {
-            $this->audit_log('self_update', false, $ip, 'Dangerous pattern detected: remote file_get_contents()');
-            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: remote file_get_contents()', ['status' => 403]);
-        }
-
-        // --- Validation 9: Extract version from new file ---
-        $new_version = 'unknown';
-        if (preg_match('/\*\s*Version:\s*([0-9]+\.[0-9]+\.[0-9]+)/', $new_plugin_content, $m)) {
-            $new_version = $m[1];
-        }
-
-        // --- Initialize WP_Filesystem ---
-        if (!function_exists('WP_Filesystem')) {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-        }
-        WP_Filesystem();
-        global $wp_filesystem;
-
-        if (!$wp_filesystem) {
-            $this->audit_log('self_update', false, $ip, 'WP_Filesystem not available');
-            return new WP_Error('server_error', 'Filesystem access not available.', ['status' => 500]);
-        }
-
-        $plugin_file = plugin_dir_path(__FILE__) . 'sadie-publisher.php';
-        $backup_file = plugin_dir_path(__FILE__) . 'sadie-publisher.php.backup';
-
-        // --- Create backup of current version ---
-        if ($wp_filesystem->exists($plugin_file)) {
-            $current_content = $wp_filesystem->get_contents($plugin_file);
-            if (!$wp_filesystem->put_contents($backup_file, $current_content, FS_CHMOD_FILE)) {
-                $this->audit_log('self_update', false, $ip, 'Failed to create backup');
-                return new WP_Error('server_error', 'Failed to create backup.', ['status' => 500]);
-            }
-        }
-
-        // --- Write new plugin file ---
-        if (!$wp_filesystem->put_contents($plugin_file, $new_plugin_content, FS_CHMOD_FILE)) {
-            // Restore backup
-            if ($wp_filesystem->exists($backup_file)) {
-                $wp_filesystem->put_contents($plugin_file, $wp_filesystem->get_contents($backup_file), FS_CHMOD_FILE);
-            }
-            $this->audit_log('self_update', false, $ip, 'Failed to write new plugin file');
-            return new WP_Error('server_error', 'Failed to write update. Previous version restored.', ['status' => 500]);
-        }
-
-        // --- Clean up backup after successful write ---
-        $wp_filesystem->delete($backup_file);
-
-        $this->audit_log('self_update', true, $ip, "Updated to v{$new_version} from v" . SADIE_PUBLISHER_VERSION);
-
-        return [
-            'success' => true,
-            'previous_version' => SADIE_PUBLISHER_VERSION,
-            'new_version' => $new_version,
-            'message' => "Plugin updated to v{$new_version}.",
-        ];
     }
 }
 
