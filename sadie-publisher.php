@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: One-way content publishing from Sadie Blog Command Center to WordPress. Security-hardened, builder-aware.
- * Version: 2.4.0
+ * Version: 2.3.0
  * Author: Sadie SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,7 +11,6 @@
  * Requires at least: 5.8
  *
  * Changelog:
- * 2.4.0 - wp_options read/write endpoint for remote plugin configuration
  * 2.3.0 - Elementor data read/write support in update endpoint, GET post-data endpoint
  * 2.2.1 - Heartbeat now reports scheduled (future) post count
  * 2.2.0 - Secure self-update endpoint, date/scheduling support in create+update, version bump
@@ -27,7 +26,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '2.4.0');
+define('SADIE_PUBLISHER_VERSION', '2.3.0');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -449,18 +448,6 @@ class Sadie_Publisher {
         register_rest_route($ns, '/self-update', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_self_update'],
-            'permission_callback' => [$this, 'verify_request'],
-        ]);
-
-        // WP options read/write (GET = read, POST = write)
-        register_rest_route($ns, '/options', [
-            'methods' => 'GET',
-            'callback' => [$this, 'handle_options_get'],
-            'permission_callback' => [$this, 'verify_request'],
-        ]);
-        register_rest_route($ns, '/options', [
-            'methods' => 'POST',
-            'callback' => [$this, 'handle_options_set'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
     }
@@ -1573,64 +1560,6 @@ class Sadie_Publisher {
      * 9. Uses WP_Filesystem — no raw file operations
      * 10. Full audit logging of every step
      */
-    /**
-     * GET /options?keys[]=option_name1&keys[]=option_name2
-     * Returns the current values of the requested wp_options keys (unserialized).
-     */
-    public function handle_options_get($request) {
-        $ip = $this->get_client_ip();
-        $keys = $request->get_param('keys');
-        if (empty($keys) || !is_array($keys)) {
-            return new WP_Error('bad_request', 'keys[] parameter required.', ['status' => 400]);
-        }
-        $result = [];
-        foreach ($keys as $key) {
-            $key = sanitize_key($key);
-            if ($key) {
-                $result[$key] = get_option($key);
-            }
-        }
-        $this->audit_log('options_get', true, $ip, implode(',', array_keys($result)));
-        return new WP_REST_Response($result, 200);
-    }
-
-    /**
-     * POST /options
-     * Body: { "options": { "option_name": <value>, ... } }
-     * Updates each key in wp_options. Values are stored as-is (PHP mixed type).
-     */
-    public function handle_options_set($request) {
-        $ip = $this->get_client_ip();
-        $params = $request->get_json_params();
-        $options = $params['options'] ?? null;
-        if (empty($options) || !is_array($options)) {
-            return new WP_Error('bad_request', 'options object required.', ['status' => 400]);
-        }
-        $updated = [];
-        $failed  = [];
-        foreach ($options as $key => $value) {
-            $key = sanitize_key($key);
-            if (!$key) continue;
-            $ok = update_option($key, $value);
-            if ($ok) {
-                $updated[] = $key;
-            } else {
-                // update_option returns false when value is unchanged — check if it matches
-                $current = get_option($key);
-                if ($current == $value) {
-                    $updated[] = $key; // already correct
-                } else {
-                    $failed[] = $key;
-                }
-            }
-        }
-        $this->audit_log('options_set', empty($failed), $ip, implode(',', $updated));
-        return new WP_REST_Response([
-            'updated' => $updated,
-            'failed'  => $failed,
-        ], 200);
-    }
-
     public function handle_self_update($request) {
         $ip = $this->get_client_ip();
         $params = $request->get_json_params();
@@ -1653,7 +1582,7 @@ class Sadie_Publisher {
         $host = strtolower($parsed['host'] ?? '');
         $trusted = false;
         foreach (self::$trusted_update_domains as $domain) {
-            if ($host === $domain || substr($host, -strlen('.' . $domain)) === '.' . $domain) {
+            if ($host === $domain || str_ends_with($host, '.' . $domain)) {
                 $trusted = true;
                 break;
             }
@@ -1665,7 +1594,7 @@ class Sadie_Publisher {
 
         // --- Validation 4: URL path must end in .zip ---
         $path = $parsed['path'] ?? '';
-        if (substr(strtolower($path), -4) !== '.zip') {
+        if (!str_ends_with(strtolower($path), '.zip')) {
             $this->audit_log('self_update', false, $ip, 'URL does not point to a .zip file');
             return new WP_Error('bad_request', 'zip_url must point to a .zip file.', ['status' => 400]);
         }
@@ -1717,7 +1646,7 @@ class Sadie_Publisher {
             $entry = $zip->getNameIndex($i);
 
             // Skip directories and macOS resource forks
-            if (substr($entry, -1) === '/' || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
+            if (str_ends_with($entry, '/') || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
                 continue;
             }
 
