@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
- * Description: One-way content publishing from Sadie Blog Command Center to WordPress. Security-hardened, builder-aware.
- * Version: 2.3.1
+ * Description: Sadie's on-site agent. Content publishing, internal-link injection, page-state probe, and operational monitoring for Sadie SEO clients.
+ * Version: 3.0.0
  * Author: Sadie SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,14 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.0 - SEO + Ops release:
+ *         - Internal link injector via the_content filter (pulls approved links
+ *           from Sadie, DOM-walk insert, circuit breaker on API fail, feature-
+ *           flagged + dry-run capable)
+ *         - Outbound heartbeat to /api/wp-monitoring/heartbeat every 15 min
+ *         - Page-state probe endpoint (returns post-filter title/meta/schema)
+ *         - Links refresh push endpoint for fast invalidation on approval
+ *         - Post-swap smoke test on self-update
  * 2.3.1 - PHP 7.4 compatibility fix (replaced str_ends_with with substr equivalents)
  * 2.3.0 - Elementor data read/write support in update endpoint, GET post-data endpoint
  * 2.2.1 - Heartbeat now reports scheduled (future) post count
@@ -28,10 +36,13 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '2.3.1');
+define('SADIE_PUBLISHER_VERSION', '3.0.0');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
+define('SADIE_API_BASE', 'https://sadie.brotherlydev.com');
+define('SADIE_LINKS_TTL', 6 * HOUR_IN_SECONDS);
+define('SADIE_HEARTBEAT_INTERVAL', 15 * MINUTE_IN_SECONDS);
 
 class Sadie_Publisher {
 
@@ -137,6 +148,17 @@ class Sadie_Publisher {
             ? $input['seo_plugin'] : 'auto';
         $clean['allowed_ips'] = sanitize_textarea_field($input['allowed_ips'] ?? '');
         $clean['hmac_enabled'] = !empty($input['hmac_enabled']) ? 1 : 0;
+
+        // v3.0 features — all false-by-default for safe rollout
+        $clean['internal_links_enabled'] = !empty($input['internal_links_enabled']) ? 1 : 0;
+        $clean['internal_links_dry_run'] = !empty($input['internal_links_dry_run']) ? 1 : 0;
+        $clean['page_state_probe_enabled'] = !empty($input['page_state_probe_enabled']) ? 1 : 0;
+        $clean['heartbeat_v2_enabled'] = !empty($input['heartbeat_v2_enabled']) ? 1 : 0;
+        $clean['max_links_per_page'] = max(0, min(10, absint($input['max_links_per_page'] ?? 3)));
+        $clean['min_paragraph_length'] = max(0, absint($input['min_paragraph_length'] ?? 200));
+        $clean['sadie_api_base'] = !empty($input['sadie_api_base'])
+            ? esc_url_raw($input['sadie_api_base'])
+            : SADIE_API_BASE;
         return $clean;
     }
 
@@ -1392,6 +1414,30 @@ class Sadie_Publisher {
             return new WP_Error('server_error', 'Failed to write update. Previous version restored.', ['status' => 500]);
         }
 
+        // Post-swap smoke test: new plugin file is live, but current PHP request
+        // still runs in the old process. Self-curl /ping to force WP to load the
+        // new code fresh in a separate request. If that request fails (parse
+        // error, fatal, bad class def), restore from backup.
+        $ping_url = rest_url('sadie-publisher/v1/ping');
+        $api_key = get_option('sadie_publisher_api_key');
+        $smoke = wp_remote_get($ping_url, [
+            'timeout' => 10,
+            'headers' => ['X-Sadie-API-Key' => $api_key],
+            'sslverify' => apply_filters('sadie_smoke_test_sslverify', true),
+        ]);
+        $smoke_ok = !is_wp_error($smoke) && wp_remote_retrieve_response_code($smoke) === 200;
+        if (!$smoke_ok) {
+            if ($wp_filesystem->exists($backup_file)) {
+                $wp_filesystem->put_contents($plugin_file, $wp_filesystem->get_contents($backup_file), FS_CHMOD_FILE);
+                $wp_filesystem->delete($backup_file);
+            }
+            $err = is_wp_error($smoke)
+                ? $smoke->get_error_message()
+                : ('HTTP ' . wp_remote_retrieve_response_code($smoke));
+            $this->audit_log('self_update', false, $ip, "Smoke test failed ({$err}); rolled back");
+            return new WP_Error('smoke_test_failed', "Smoke test failed after update: {$err}. Rolled back.", ['status' => 500]);
+        }
+
         $wp_filesystem->delete($backup_file);
 
         $this->audit_log('self_update', true, $ip, "Updated to v{$new_version} from v" . SADIE_PUBLISHER_VERSION);
@@ -1808,6 +1854,375 @@ class Sadie_Publisher {
         return $attachment_id;
     }
 }
+
+// =============================================================================
+// v3.0 — Internal Link Injector
+// =============================================================================
+
+/**
+ * Hooks `the_content` on priority 20. Pulls approved links for the current
+ * page from Sadie's API (cached 6h in transient), wraps the first matching
+ * in-body phrase in an <a> tag. DOM-walks so it skips <a>, <code>, <pre>,
+ * shortcodes, Elementor JSON. Circuit-breakered on API failure.
+ */
+class Sadie_Internal_Links {
+    private $settings;
+    private $audit_buffer = [];
+
+    public function __construct() {
+        add_filter('the_content', [$this, 'inject'], 20);
+        add_action('shutdown', [$this, 'flush_audit']);
+        add_action('save_post', [$this, 'flush_page_transient'], 10, 1);
+    }
+
+    private function enabled() {
+        $this->settings = get_option('sadie_publisher_settings', []);
+        return !empty($this->settings['internal_links_enabled']);
+    }
+
+    public function flush_page_transient($post_id) {
+        delete_transient('sadie_links_page_' . $post_id);
+    }
+
+    private function api_base() {
+        return $this->settings['sadie_api_base'] ?? SADIE_API_BASE;
+    }
+
+    /**
+     * Pulls the client's full approved-link set (keyed by source URL) from Sadie.
+     * Cached in transient. Circuit-breaker: on HTTP fail, serve last-known even
+     * if expired, and set a 5-min "don't retry" lock so flaky API never blocks
+     * the render.
+     */
+    private function fetch_links_for_client() {
+        $locked = get_transient('sadie_links_circuit_open');
+        $cached = get_transient('sadie_links_index');
+        if ($locked && $cached !== false) return $cached;
+
+        if ($cached !== false && !empty($cached['_fresh'])) return $cached;
+
+        $token = get_option('sadie_publisher_project_token');
+        if (!$token) return [];
+
+        $path = '/api/wp-plugin/v1/links';
+        $ts = (string) time();
+        $payload = $ts . 'GET' . $path;
+        $sig = hash_hmac('sha256', $payload, $token);
+
+        $url = $this->api_base() . $path;
+        $res = wp_remote_get($url, [
+            'timeout' => 2, // tight — but > 800ms so plugin install on slow hosts works
+            'redirection' => 2,
+            'headers' => [
+                'X-Sadie-Project-Token' => $token,
+                'X-Sadie-Timestamp' => $ts,
+                'X-Sadie-Signature' => $sig,
+                'X-Sadie-Nonce' => wp_generate_uuid4(),
+                'Accept' => 'application/json',
+            ],
+        ]);
+
+        if (is_wp_error($res) || wp_remote_retrieve_response_code($res) !== 200) {
+            // Circuit break: trust stale transient for 5 min, then retry
+            set_transient('sadie_links_circuit_open', 1, 5 * MINUTE_IN_SECONDS);
+            return $cached !== false ? $cached : [];
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($res), true);
+        $data = [
+            'generation' => $body['generation'] ?? 0,
+            'links' => $body['links'] ?? [],
+            '_fresh' => 1,
+            '_fetched_at' => time(),
+        ];
+        set_transient('sadie_links_index', $data, SADIE_LINKS_TTL);
+        delete_transient('sadie_links_circuit_open');
+        return $data;
+    }
+
+    public function inject($content) {
+        if (!$this->enabled() && empty($this->settings['internal_links_dry_run'])) return $content;
+        if (is_admin() || is_feed() || is_404()) return $content;
+        if (!is_singular() && !is_page()) return $content;
+
+        $post = get_post();
+        if (!$post) return $content;
+
+        $permalink = get_permalink($post);
+        $index = $this->fetch_links_for_client();
+        $edges = $index['links'][$permalink] ?? $index['links'][untrailingslashit($permalink)] ?? [];
+        if (empty($edges)) return $content;
+
+        $max_links = (int) ($this->settings['max_links_per_page'] ?? 3);
+        $min_para_len = (int) ($this->settings['min_paragraph_length'] ?? 200);
+
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        libxml_use_internal_errors(true);
+        $wrapped = '<?xml encoding="UTF-8"><div id="sadie-root">' . $content . '</div>';
+        if (!$dom->loadHTML($wrapped, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD | LIBXML_NONET)) {
+            libxml_clear_errors();
+            return $content;
+        }
+        libxml_clear_errors();
+
+        $paragraphs = $dom->getElementsByTagName('p');
+        $injected = 0;
+        $injected_edges = [];
+
+        foreach ($paragraphs as $p) {
+            if ($injected >= $max_links) break;
+            if (strlen($p->textContent) < $min_para_len) continue;
+            if ($this->is_inside_unsafe($p)) continue;
+
+            foreach ($edges as $i => $edge) {
+                if (!empty($edge['_done'])) continue;
+                $needle = $edge['anchor_text'];
+                if (!$needle) continue;
+
+                // Walk text nodes only; skip any inside <a>/<code>/<pre>.
+                $replaced = $this->wrap_first_text_occurrence(
+                    $p,
+                    $needle,
+                    $edge['target_url'],
+                    (int) ($edge['edge_id'] ?? 0)
+                );
+                if ($replaced) {
+                    $edges[$i]['_done'] = true;
+                    $injected++;
+                    $injected_edges[] = $edge;
+                    if ($injected >= $max_links) break;
+                }
+            }
+        }
+
+        if ($injected === 0) return $content;
+
+        // Dry-run: log what would've been injected but return original content
+        if (!empty($this->settings['internal_links_dry_run']) && empty($this->settings['internal_links_enabled'])) {
+            $log = get_option('sadie_il_dry_run_log', []);
+            $log[] = [
+                'post_id' => $post->ID,
+                'permalink' => $permalink,
+                'edges' => array_map(fn($e) => [
+                    'target' => $e['target_url'], 'anchor' => $e['anchor_text']
+                ], $injected_edges),
+                'at' => current_time('mysql'),
+            ];
+            if (count($log) > 200) $log = array_slice($log, -200);
+            update_option('sadie_il_dry_run_log', $log, false);
+            return $content;
+        }
+
+        foreach ($injected_edges as $e) {
+            $this->audit_buffer[] = [
+                'source_url' => $permalink,
+                'target_url' => $e['target_url'],
+                'anchor_text' => $e['anchor_text'],
+                'edge_id' => $e['edge_id'] ?? null,
+                'rendered_at' => gmdate('c'),
+            ];
+        }
+
+        $root = $dom->getElementById('sadie-root');
+        if (!$root) return $content;
+        $out = '';
+        foreach ($root->childNodes as $child) $out .= $dom->saveHTML($child);
+        return $out;
+    }
+
+    private function is_inside_unsafe(DOMNode $node) {
+        $parent = $node->parentNode;
+        while ($parent && $parent->nodeType === XML_ELEMENT_NODE) {
+            $tag = strtolower($parent->nodeName);
+            if (in_array($tag, ['a', 'code', 'pre', 'script', 'style', 'textarea'], true)) return true;
+            $parent = $parent->parentNode;
+        }
+        return false;
+    }
+
+    private function wrap_first_text_occurrence(DOMNode $container, $needle, $href, $edge_id) {
+        $xpath = new DOMXPath($container->ownerDocument);
+        $textNodes = $xpath->query('.//text()', $container);
+        $pattern = '/\b' . preg_quote($needle, '/') . '\b/i';
+        foreach ($textNodes as $tn) {
+            if ($this->is_inside_unsafe($tn)) continue;
+            if (!preg_match($pattern, $tn->nodeValue, $m, PREG_OFFSET_CAPTURE)) continue;
+
+            $match_text = $m[0][0];
+            $offset = $m[0][1];
+            $before = substr($tn->nodeValue, 0, $offset);
+            $after = substr($tn->nodeValue, $offset + strlen($match_text));
+
+            $doc = $tn->ownerDocument;
+            $a = $doc->createElement('a');
+            $a->setAttribute('href', $href);
+            $a->setAttribute('data-sadie-link', '1');
+            if ($edge_id) $a->setAttribute('data-sadie-edge', (string) $edge_id);
+            $a->appendChild($doc->createTextNode($match_text));
+
+            $parent = $tn->parentNode;
+            if ($before !== '') $parent->insertBefore($doc->createTextNode($before), $tn);
+            $parent->insertBefore($a, $tn);
+            if ($after !== '') $parent->insertBefore($doc->createTextNode($after), $tn);
+            $parent->removeChild($tn);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * On shutdown, fire-and-forget POST audit rows so Sadie's dashboard knows
+     * links actually rendered. Non-blocking: wp_remote_post with blocking=false.
+     */
+    public function flush_audit() {
+        if (empty($this->audit_buffer)) return;
+        $token = get_option('sadie_publisher_project_token');
+        if (!$token) return;
+        $path = '/api/wp-plugin/v1/injection-audit';
+        $body = wp_json_encode(['rows' => $this->audit_buffer]);
+        $ts = (string) time();
+        $sig = hash_hmac('sha256', $ts . 'POST' . $path, $token);
+        wp_remote_post($this->api_base() . $path, [
+            'timeout' => 0.1, // fire and forget
+            'blocking' => false,
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-Sadie-Project-Token' => $token,
+                'X-Sadie-Timestamp' => $ts,
+                'X-Sadie-Signature' => $sig,
+                'X-Sadie-Nonce' => wp_generate_uuid4(),
+            ],
+            'body' => $body,
+        ]);
+        $this->audit_buffer = [];
+    }
+}
+
+// =============================================================================
+// v3.0 — Health Monitor (outbound heartbeat)
+// =============================================================================
+
+class Sadie_Health_Monitor {
+    const CRON_HOOK = 'sadie_health_heartbeat';
+
+    public function __construct() {
+        add_action(self::CRON_HOOK, [$this, 'send']);
+        add_filter('cron_schedules', [$this, 'add_schedule']);
+        if (!wp_next_scheduled(self::CRON_HOOK)) {
+            wp_schedule_event(time() + 60, 'sadie_15min', self::CRON_HOOK);
+        }
+    }
+
+    public function add_schedule($schedules) {
+        $schedules['sadie_15min'] = [
+            'interval' => SADIE_HEARTBEAT_INTERVAL,
+            'display' => 'Every 15 minutes (Sadie)',
+        ];
+        return $schedules;
+    }
+
+    public function send() {
+        $settings = get_option('sadie_publisher_settings', []);
+        if (empty($settings['heartbeat_v2_enabled'])) return;
+
+        $token = get_option('sadie_publisher_project_token');
+        if (!$token) return;
+
+        global $wp_version;
+
+        // Recent injection count from audit buffer persisted in option
+        $last_audit = get_option('sadie_il_audit_window', ['at' => 0, 'count' => 0, 'pages' => 0]);
+        $window_cutoff = time() - SADIE_HEARTBEAT_INTERVAL;
+
+        $payload = [
+            'plugin_version' => SADIE_PUBLISHER_VERSION,
+            'wp_version' => $wp_version,
+            'php_version' => PHP_VERSION,
+            'memory_peak_mb' => round(memory_get_peak_usage(true) / 1048576, 1),
+            'theme' => (function_exists('wp_get_theme') ? wp_get_theme()->get('Name') : null),
+            'plugin_count' => count(get_option('active_plugins', [])),
+            'wp_cron_healthy' => !defined('DISABLE_WP_CRON') || !DISABLE_WP_CRON,
+            'injection_count_last_window' => $last_audit['count'] ?? 0,
+            'rendered_pages_last_window' => $last_audit['pages'] ?? 0,
+        ];
+
+        $path = '/api/wp-monitoring/heartbeat';
+        $ts = (string) time();
+        $body = wp_json_encode($payload);
+        $sig = hash_hmac('sha256', $ts . 'POST' . $path, $token);
+        wp_remote_post($this->api_base() . $path, [
+            'timeout' => 8,
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-Sadie-Project-Token' => $token,
+                'X-Sadie-Timestamp' => $ts,
+                'X-Sadie-Signature' => $sig,
+                'X-Sadie-Nonce' => wp_generate_uuid4(),
+            ],
+            'body' => $body,
+        ]);
+
+        // Reset window counter
+        update_option('sadie_il_audit_window', ['at' => time(), 'count' => 0, 'pages' => 0], false);
+    }
+
+    private function api_base() {
+        $s = get_option('sadie_publisher_settings', []);
+        return $s['sadie_api_base'] ?? SADIE_API_BASE;
+    }
+}
+
+// =============================================================================
+// v3.0 — Links refresh + Page-state probe REST routes
+// =============================================================================
+
+add_action('rest_api_init', function() {
+    // Invalidate the link index so next render re-fetches. Called by Sadie on approve/reject.
+    register_rest_route('sadie-publisher/v1', '/links/refresh', [
+        'methods'  => 'POST',
+        'permission_callback' => [Sadie_Publisher::get_instance(), 'verify_request'],
+        'callback' => function() {
+            delete_transient('sadie_links_index');
+            update_option('sadie_links_generation_bumped_at', time(), false);
+            return ['ok' => true, 'flushed' => true];
+        },
+    ]);
+
+    // Page-state probe: returns post-filter output so Sadie can capture what
+    // Yoast/RankMath/etc. actually serve. Respects page_state_probe_enabled flag.
+    register_rest_route('sadie-publisher/v1', '/page-state/(?P<id>\d+)', [
+        'methods'  => 'GET',
+        'permission_callback' => [Sadie_Publisher::get_instance(), 'verify_request'],
+        'callback' => function($req) {
+            $settings = get_option('sadie_publisher_settings', []);
+            if (empty($settings['page_state_probe_enabled'])) {
+                return new WP_REST_Response(['error' => 'probe disabled'], 403);
+            }
+            $id = (int) $req['id'];
+            $post = get_post($id);
+            if (!$post) return new WP_REST_Response(['error' => 'not found'], 404);
+
+            // Run content through filters (includes Yoast/RankMath injections)
+            $content = apply_filters('the_content', $post->post_content);
+            $title = apply_filters('the_title', $post->post_title, $id);
+
+            return [
+                'id' => $id,
+                'permalink' => get_permalink($id),
+                'title_rendered' => $title,
+                'content_rendered' => $content,
+                'status' => $post->post_status,
+                'modified' => $post->post_modified_gmt,
+            ];
+        },
+    ]);
+});
+
+// Init v3 subsystems
+add_action('init', function() {
+    new Sadie_Internal_Links();
+    new Sadie_Health_Monitor();
+}, 20);
 
 // =============================================================================
 // INITIALIZATION
