@@ -11,6 +11,11 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.1 - Internal-link injector switched from in-body DOM-walk to a single
+ *         display:none "Related Pages" block appended to post content.
+ *         Matches OTTO's model: Googlebot still crawls + follows + PageRank
+ *         flows, but no visual change to the page. Simpler, safer, no risk
+ *         of breaking theme layouts.
  * 3.0.0 - SEO + Ops release:
  *         - Internal link injector via the_content filter (pulls approved links
  *           from Sadie, DOM-walk insert, circuit breaker on API fail, feature-
@@ -36,7 +41,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.0');
+define('SADIE_PUBLISHER_VERSION', '3.0.1');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1940,6 +1945,12 @@ class Sadie_Internal_Links {
         return $data;
     }
 
+    /**
+     * Append a single hidden "Related Pages" block to post content. Matches
+     * OTTO's model — visible to Googlebot (rendered DOM crawl), invisible to
+     * humans (display:none), no risk to theme layout. Simpler + deterministic
+     * than in-body wrapping: every approved link gets placed.
+     */
     public function inject($content) {
         if (!$this->enabled() && empty($this->settings['internal_links_dry_run'])) return $content;
         if (is_admin() || is_feed() || is_404()) return $content;
@@ -1953,59 +1964,18 @@ class Sadie_Internal_Links {
         $edges = $index['links'][$permalink] ?? $index['links'][untrailingslashit($permalink)] ?? [];
         if (empty($edges)) return $content;
 
-        $max_links = (int) ($this->settings['max_links_per_page'] ?? 3);
-        $min_para_len = (int) ($this->settings['min_paragraph_length'] ?? 200);
+        $max_links = (int) ($this->settings['max_links_per_page'] ?? 6);
+        $edges = array_slice($edges, 0, $max_links);
 
-        $dom = new DOMDocument('1.0', 'UTF-8');
-        libxml_use_internal_errors(true);
-        $wrapped = '<?xml encoding="UTF-8"><div id="sadie-root">' . $content . '</div>';
-        if (!$dom->loadHTML($wrapped, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD | LIBXML_NONET)) {
-            libxml_clear_errors();
-            return $content;
-        }
-        libxml_clear_errors();
-
-        $paragraphs = $dom->getElementsByTagName('p');
-        $injected = 0;
-        $injected_edges = [];
-
-        foreach ($paragraphs as $p) {
-            if ($injected >= $max_links) break;
-            if (strlen($p->textContent) < $min_para_len) continue;
-            if ($this->is_inside_unsafe($p)) continue;
-
-            foreach ($edges as $i => $edge) {
-                if (!empty($edge['_done'])) continue;
-                $needle = $edge['anchor_text'];
-                if (!$needle) continue;
-
-                // Walk text nodes only; skip any inside <a>/<code>/<pre>.
-                $replaced = $this->wrap_first_text_occurrence(
-                    $p,
-                    $needle,
-                    $edge['target_url'],
-                    (int) ($edge['edge_id'] ?? 0)
-                );
-                if ($replaced) {
-                    $edges[$i]['_done'] = true;
-                    $injected++;
-                    $injected_edges[] = $edge;
-                    if ($injected >= $max_links) break;
-                }
-            }
-        }
-
-        if ($injected === 0) return $content;
-
-        // Dry-run: log what would've been injected but return original content
+        // Dry-run: log what would've been injected, return original content
         if (!empty($this->settings['internal_links_dry_run']) && empty($this->settings['internal_links_enabled'])) {
             $log = get_option('sadie_il_dry_run_log', []);
             $log[] = [
                 'post_id' => $post->ID,
                 'permalink' => $permalink,
-                'edges' => array_map(fn($e) => [
-                    'target' => $e['target_url'], 'anchor' => $e['anchor_text']
-                ], $injected_edges),
+                'edges' => array_map(function ($e) {
+                    return ['target' => $e['target_url'], 'anchor' => $e['anchor_text']];
+                }, $edges),
                 'at' => current_time('mysql'),
             ];
             if (count($log) > 200) $log = array_slice($log, -200);
@@ -2013,7 +1983,7 @@ class Sadie_Internal_Links {
             return $content;
         }
 
-        foreach ($injected_edges as $e) {
+        foreach ($edges as $e) {
             $this->audit_buffer[] = [
                 'source_url' => $permalink,
                 'target_url' => $e['target_url'],
@@ -2023,51 +1993,31 @@ class Sadie_Internal_Links {
             ];
         }
 
-        $root = $dom->getElementById('sadie-root');
-        if (!$root) return $content;
-        $out = '';
-        foreach ($root->childNodes as $child) $out .= $dom->saveHTML($child);
-        return $out;
+        return $content . $this->build_hidden_block($edges);
     }
 
-    private function is_inside_unsafe(DOMNode $node) {
-        $parent = $node->parentNode;
-        while ($parent && $parent->nodeType === XML_ELEMENT_NODE) {
-            $tag = strtolower($parent->nodeName);
-            if (in_array($tag, ['a', 'code', 'pre', 'script', 'style', 'textarea'], true)) return true;
-            $parent = $parent->parentNode;
+    /**
+     * Hidden "Related Pages" block. Entire wrapper is display:none, plus each
+     * <li> is display:none as a belt-and-suspenders in case any theme CSS
+     * overrides the wrapper. Matches OTTO's otto-inlinks-module pattern.
+     */
+    private function build_hidden_block(array $edges) {
+        $items = '';
+        foreach ($edges as $e) {
+            $href = esc_url($e['target_url']);
+            $anchor = esc_html($e['anchor_text']);
+            $edge_id = (int) ($e['edge_id'] ?? 0);
+            $items .= sprintf(
+                '<li style="display:none"><a class="sadie-inlink" data-sadie-pixel="dynamic-seo" data-sadie-edge="%d" href="%s">%s</a></li>',
+                $edge_id,
+                $href,
+                $anchor
+            );
         }
-        return false;
-    }
-
-    private function wrap_first_text_occurrence(DOMNode $container, $needle, $href, $edge_id) {
-        $xpath = new DOMXPath($container->ownerDocument);
-        $textNodes = $xpath->query('.//text()', $container);
-        $pattern = '/\b' . preg_quote($needle, '/') . '\b/i';
-        foreach ($textNodes as $tn) {
-            if ($this->is_inside_unsafe($tn)) continue;
-            if (!preg_match($pattern, $tn->nodeValue, $m, PREG_OFFSET_CAPTURE)) continue;
-
-            $match_text = $m[0][0];
-            $offset = $m[0][1];
-            $before = substr($tn->nodeValue, 0, $offset);
-            $after = substr($tn->nodeValue, $offset + strlen($match_text));
-
-            $doc = $tn->ownerDocument;
-            $a = $doc->createElement('a');
-            $a->setAttribute('href', $href);
-            $a->setAttribute('data-sadie-link', '1');
-            if ($edge_id) $a->setAttribute('data-sadie-edge', (string) $edge_id);
-            $a->appendChild($doc->createTextNode($match_text));
-
-            $parent = $tn->parentNode;
-            if ($before !== '') $parent->insertBefore($doc->createTextNode($before), $tn);
-            $parent->insertBefore($a, $tn);
-            if ($after !== '') $parent->insertBefore($doc->createTextNode($after), $tn);
-            $parent->removeChild($tn);
-            return true;
-        }
-        return false;
+        return sprintf(
+            '<div class="sadie-inlinks-module" data-sadie-pixel="dynamic-seo" style="display:none"><h5>Related Pages:</h5><ul>%s</ul></div>',
+            $items
+        );
     }
 
     /**
