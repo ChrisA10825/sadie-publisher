@@ -11,6 +11,15 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.2 - CRITICAL FIX: self-update smoke test was broken on HMAC-enabled
+ *         sites. Used to self-curl /ping with API key only -> got 401
+ *         when HMAC was on -> treated as failure -> rolled back every
+ *         self-update. Now:
+ *           (a) smoke test hits /wp-json/ root (no auth required)
+ *           (b) accepts HTTP < 500 as pass (plugin loaded cleanly)
+ *           (c) calls opcache_invalidate($plugin_file, true) after write
+ *               so OpCache doesn't serve stale opcodes
+ *           (d) richer audit log so we can debug future failures
  * 3.0.1 - Internal-link injector switched from in-body DOM-walk to a single
  *         display:none "Related Pages" block appended to post content.
  *         Matches OTTO's model: Googlebot still crawls + follows + PageRank
@@ -41,7 +50,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.1');
+define('SADIE_PUBLISHER_VERSION', '3.0.2');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1419,33 +1428,58 @@ class Sadie_Publisher {
             return new WP_Error('server_error', 'Failed to write update. Previous version restored.', ['status' => 500]);
         }
 
-        // Post-swap smoke test: new plugin file is live, but current PHP request
-        // still runs in the old process. Self-curl /ping to force WP to load the
-        // new code fresh in a separate request. If that request fails (parse
-        // error, fatal, bad class def), restore from backup.
-        $ping_url = rest_url('sadie-publisher/v1/ping');
-        $api_key = get_option('sadie_publisher_api_key');
-        $smoke = wp_remote_get($ping_url, [
-            'timeout' => 10,
-            'headers' => ['X-Sadie-API-Key' => $api_key],
-            'sslverify' => apply_filters('sadie_smoke_test_sslverify', true),
-        ]);
-        $smoke_ok = !is_wp_error($smoke) && wp_remote_retrieve_response_code($smoke) === 200;
+        // Force OpCache to invalidate the new file so subsequent requests load
+        // fresh opcodes. Without this, PHP-FPM hosts with
+        // opcache.validate_timestamps=0 keep running the OLD compiled version
+        // even though the file on disk is new.
+        if (function_exists('opcache_invalidate')) {
+            @opcache_invalidate($plugin_file, true);
+        }
+
+        // Post-swap smoke test: self-curl /wp-json/ (the REST root — no auth
+        // required). If the new plugin has a parse / fatal error, WP returns
+        // 500 on every endpoint. Any non-5xx response proves the plugin
+        // loaded clean. We do 3 attempts with 2s backoff to smooth out
+        // transient hosting blips (503s we've seen on travelbug).
+        //
+        // Why not /ping anymore: /ping requires auth. On HMAC-enabled sites,
+        // unsigned probes got 401, which older versions mis-classified as
+        // "failure" and rolled back every self-update. Root-probing dodges
+        // the auth layer entirely.
+        $probe_url = home_url('/wp-json/');
+        $smoke_ok = false;
+        $smoke_info = '';
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            $smoke = wp_remote_get($probe_url, [
+                'timeout' => 10,
+                'sslverify' => apply_filters('sadie_smoke_test_sslverify', true),
+            ]);
+            $code = is_wp_error($smoke) ? 0 : (int) wp_remote_retrieve_response_code($smoke);
+            $smoke_info = is_wp_error($smoke)
+                ? ('wp_error: ' . $smoke->get_error_message())
+                : ('HTTP ' . $code);
+            if (!is_wp_error($smoke) && $code > 0 && $code < 500) {
+                $smoke_ok = true;
+                break;
+            }
+            if ($attempt < 3) usleep(2_000_000); // 2s
+        }
+
         if (!$smoke_ok) {
             if ($wp_filesystem->exists($backup_file)) {
                 $wp_filesystem->put_contents($plugin_file, $wp_filesystem->get_contents($backup_file), FS_CHMOD_FILE);
                 $wp_filesystem->delete($backup_file);
+                if (function_exists('opcache_invalidate')) {
+                    @opcache_invalidate($plugin_file, true);
+                }
             }
-            $err = is_wp_error($smoke)
-                ? $smoke->get_error_message()
-                : ('HTTP ' . wp_remote_retrieve_response_code($smoke));
-            $this->audit_log('self_update', false, $ip, "Smoke test failed ({$err}); rolled back");
-            return new WP_Error('smoke_test_failed', "Smoke test failed after update: {$err}. Rolled back.", ['status' => 500]);
+            $this->audit_log('self_update', false, $ip, "Smoke test failed ({$smoke_info}); rolled back");
+            return new WP_Error('smoke_test_failed', "Smoke test failed after update: {$smoke_info}. Rolled back.", ['status' => 500]);
         }
 
         $wp_filesystem->delete($backup_file);
 
-        $this->audit_log('self_update', true, $ip, "Updated to v{$new_version} from v" . SADIE_PUBLISHER_VERSION);
+        $this->audit_log('self_update', true, $ip, "Updated to v{$new_version} from v" . SADIE_PUBLISHER_VERSION . " (smoke: {$smoke_info})");
 
         return [
             'success' => true,
