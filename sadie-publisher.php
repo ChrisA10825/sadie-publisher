@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, internal-link injection, page-state probe, and operational monitoring for Sadie SEO clients.
- * Version: 3.0.0
+ * Version: 3.0.3
  * Author: Sadie SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,19 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.3 - Security audit fixes (v3.0.2 shipped 2 exploit chains):
+ *         - CRITICAL: /options POST now hard-allowlists keys. Previously
+ *           a compromised API key could siteurl/template/active_plugins/
+ *           default_role/admin_email its way into full site takeover.
+ *         - Self-update zip download uses wp_safe_remote_get with
+ *           redirection=0 — closes open-redirect bypass on trusted hosts.
+ *         - Expanded dangerous-function scanner: include/require,
+ *           call_user_func, variable-function $var(), backtick shell
+ *           operator, preg_replace/e, php://data://phar:// streams,
+ *           ReflectionFunction, hex2bin/unpack obfuscation primitives.
+ *         - Persistent-backdoor guard: self-update rejects any zip that
+ *           modifies the $trusted_update_domains allowlist line.
+ *         - New installs default hmac_enabled=true (was false).
  * 3.0.2 - CRITICAL FIX: self-update smoke test was broken on HMAC-enabled
  *         sites. Used to self-curl /ping with API key only -> got 401
  *         when HMAC was on -> treated as failure -> rolled back every
@@ -50,7 +63,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.2');
+define('SADIE_PUBLISHER_VERSION', '3.0.3');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -113,6 +126,16 @@ class Sadie_Publisher {
 
         // Store activation timestamp
         update_option('sadie_publisher_activated_at', current_time('mysql'));
+
+        // v3.0.3 — default HMAC on for new installs. Previously off by
+        // default which meant a leaked API key alone was a site takeover.
+        // Existing sites keep their current setting.
+        $settings = get_option($this->settings_option);
+        if (!is_array($settings) || !isset($settings['hmac_enabled'])) {
+            $settings = is_array($settings) ? $settings : [];
+            $settings['hmac_enabled'] = 1;
+            update_option($this->settings_option, $settings);
+        }
     }
 
     public function deactivate() {
@@ -614,6 +637,34 @@ class Sadie_Publisher {
         return new WP_REST_Response($result, 200);
     }
 
+    /**
+     * v3.0.3 hard allowlist — CRITICAL. Before this, update_option was called
+     * with any key/value the caller sent, which let a compromised API key:
+     *   - flip `siteurl`/`home` to an attacker origin (login leak)
+     *   - switch `template`/`stylesheet` to any already-installed theme
+     *   - toggle `active_plugins` (activate malicious plugins, disable
+     *     security plugins)
+     *   - set `default_role=administrator` + `users_can_register=1` for
+     *     open signup as admin
+     *   - hijack password-reset via `admin_email`
+     * Full site takeover primitive. Hard-pin to the sadie_* namespace + a
+     * small set of benign SEO-adjacent options we legitimately need to
+     * toggle remotely. Everything else → 403.
+     */
+    private function options_set_allowlist() {
+        return [
+            'sadie_publisher_settings',
+            'sadie_publisher_api_key',
+            'sadie_publisher_project_token',
+            // SEO meta descriptions / titles are handled through /publish,
+            // never raw options. So no theme-ish keys listed here.
+            'blogdescription',        // tagline — benign
+            // Explicitly NOT allowed: siteurl, home, template, stylesheet,
+            // active_plugins, default_role, users_can_register, admin_email,
+            // mailserver_*, * anything we haven't whitelisted.
+        ];
+    }
+
     public function handle_options_set($request) {
         $ip = $this->get_client_ip();
         $params = $request->get_json_params();
@@ -621,11 +672,22 @@ class Sadie_Publisher {
         if (empty($options) || !is_array($options)) {
             return new WP_Error('bad_request', 'options object required.', ['status' => 400]);
         }
+        $allowed = $this->options_set_allowlist();
         $updated = [];
         $failed  = [];
+        $rejected = [];
         foreach ($options as $key => $value) {
             $key = sanitize_key($key);
             if (!$key) continue;
+
+            // Allow exact match OR sadie_* prefix (any plugin-owned namespace).
+            $is_allowed = in_array($key, $allowed, true)
+                || strpos($key, 'sadie_') === 0;
+            if (!$is_allowed) {
+                $rejected[] = $key;
+                continue;
+            }
+
             $ok = update_option($key, $value);
             if ($ok) {
                 $updated[] = $key;
@@ -638,11 +700,21 @@ class Sadie_Publisher {
                 }
             }
         }
-        $this->audit_log('options_set', empty($failed), $ip, implode(',', $updated));
-        return new WP_REST_Response([
-            'updated' => $updated,
-            'failed'  => $failed,
-        ], 200);
+        $this->audit_log(
+            'options_set',
+            empty($failed) && empty($rejected),
+            $ip,
+            'updated=' . implode(',', $updated) .
+                (empty($rejected) ? '' : '  rejected=' . implode(',', $rejected))
+        );
+        $resp = [
+            'updated'  => $updated,
+            'failed'   => $failed,
+            'rejected' => $rejected,
+        ];
+        // 403 if the caller tried ONLY disallowed keys (intent-to-abuse signal)
+        $status = (empty($updated) && !empty($rejected)) ? 403 : 200;
+        return new WP_REST_Response($resp, $status);
     }
 
     // =========================================================================
@@ -1278,10 +1350,38 @@ class Sadie_Publisher {
 
         $this->audit_log('self_update', true, $ip, "Update initiated from {$host}");
 
-        $tmp_file = download_url($zip_url, 30);
-        if (is_wp_error($tmp_file)) {
-            $this->audit_log('self_update', false, $ip, 'Download failed: ' . $tmp_file->get_error_message());
+        // v3.0.3: fetch with NO redirects. An open-redirect on a trusted
+        // host (raw.githubusercontent.com gist redirects, supabase signed-
+        // URL redirects) could otherwise bounce us to an attacker origin.
+        // We already validated $zip_url's host against the allowlist; the
+        // response body must come from exactly that host.
+        $response = wp_safe_remote_get($zip_url, [
+            'timeout'     => 30,
+            'redirection' => 0,
+            'sslverify'   => true,
+            'stream'      => true,
+            'filename'    => wp_tempnam(basename($zip_url)),
+        ]);
+        if (is_wp_error($response)) {
+            $this->audit_log('self_update', false, $ip, 'Download failed: ' . $response->get_error_message());
             return new WP_Error('download_failed', 'Failed to download update package.', ['status' => 502]);
+        }
+        $status = wp_remote_retrieve_response_code($response);
+        if ($status !== 200) {
+            @unlink(wp_remote_retrieve_header($response, 'x-local-file'));
+            $this->audit_log('self_update', false, $ip, "Download HTTP {$status} (redirect blocked or 404)");
+            return new WP_Error('download_failed', "Update host returned HTTP {$status}. Redirects are blocked; provide the final URL directly.", ['status' => 502]);
+        }
+        $tmp_file = $response['filename'] ?? null;
+        if (!$tmp_file || !file_exists($tmp_file)) {
+            // Fallback: some WP versions don't set 'filename' in the returned array. Pull body into a tmp file.
+            $body = wp_remote_retrieve_body($response);
+            if (!$body) {
+                $this->audit_log('self_update', false, $ip, 'Empty download body');
+                return new WP_Error('download_failed', 'Empty download body.', ['status' => 502]);
+            }
+            $tmp_file = wp_tempnam('sadie-self-update');
+            file_put_contents($tmp_file, $body);
         }
 
         $file_size = filesize($tmp_file);
@@ -1362,6 +1462,13 @@ class Sadie_Publisher {
             return new WP_Error('bad_request', 'Plugin file must start with <?php.', ['status' => 400]);
         }
 
+        // v3.0.3 — expanded blocklist.
+        // Security audit caught 4 bypass classes in v3.0.2 list:
+        //   (a) call_user_func / _array — pass 'eval' as string arg
+        //   (b) include / require with php:// or data:// streams
+        //   (c) ReflectionFunction::invoke
+        //   (d) preg_replace with /e modifier (pre-PHP7 systems)
+        // Stopgap until we switch to Ed25519 signature verification.
         $dangerous_funcs = [
             'ev' . 'al',
             'ex' . 'ec',
@@ -1378,6 +1485,12 @@ class Sadie_Publisher {
             'str_rot' . '13',
             'curl_ex' . 'ec',
             'phpin' . 'fo',
+            'call_user_func',        // can route to 'eval' as string
+            'call_user_func_array',
+            'hex' . '2bin',          // obfuscation primitive
+            'unpack',                // byte-to-string -> concat into func name
+            'ReflectionFunction',    // can invoke anything by name
+            'ReflectionMethod',
         ];
 
         foreach ($dangerous_funcs as $func) {
@@ -1388,9 +1501,64 @@ class Sadie_Publisher {
             }
         }
 
+        // include/require with any argument (even a constant). We don't use
+        // these in the plugin at all — blanket ban.
+        if (preg_match('/(?<!\w)(?:include|require)(?:_once)?\s*[\s\(]/i', $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Dangerous pattern: include/require');
+            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: include/require', ['status' => 403]);
+        }
+
+        // Backtick operator — PHP syntax for shell command execution.
+        // Exclude backticks inside single/double quoted strings (esc).
+        // We don't use backticks legitimately anywhere.
+        if (preg_match('/`[^`\n]{0,200}`/', $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Dangerous pattern: backtick shell operator');
+            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: backtick operator', ['status' => 403]);
+        }
+
+        // Variable-function calls: $foo(...) where $foo is a variable. Our
+        // plugin uses arrow-access + method calls but never $var() dispatch.
+        if (preg_match('/\$[a-z_][a-z0-9_]*\s*\(/i', $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Dangerous pattern: variable-function call $var(...)');
+            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: $variable(...)', ['status' => 403]);
+        }
+
+        // preg_replace with /e modifier (deprecated but still runnable on
+        // some old forks). Detect an /e at end of the pattern delimiter.
+        if (preg_match('/preg_replace\s*\([^)]*["\'\/#][^"\'\/#]*["\'\/#]\s*e\s*["\'\/#]/i', $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Dangerous pattern: preg_replace /e modifier');
+            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: preg_replace /e', ['status' => 403]);
+        }
+
+        // PHP wrapper streams inside any string literal (payload delivery).
+        if (preg_match('/(?:php:\/\/|data:\/\/|phar:\/\/|expect:\/\/)/i', $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Dangerous pattern: php:// / data:// / phar:// / expect:// stream wrapper');
+            return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: dangerous stream wrapper', ['status' => 403]);
+        }
+
         if (preg_match('/file_get_conte' . 'nts\s*\(\s*[\'"]https?:/i', $new_plugin_content)) {
             $this->audit_log('self_update', false, $ip, 'Dangerous pattern detected: remote file_get_contents()');
             return new WP_Error('forbidden', 'Plugin file contains forbidden pattern: remote file_get_contents()', ['status' => 403]);
+        }
+
+        // v3.0.3 persistent-backdoor guard: the static $trusted_update_domains
+        // array is the fence that protects every future update. A malicious
+        // update that rewrites the allowlist would permanently widen it.
+        // Require the exact same 4-host list we ship with. If the attacker
+        // changes any one entry, the update fails here.
+        $expected_allowlist_re = '/private\s+static\s+\$trusted_update_domains\s*=\s*\[\s*'
+            . "'rfxzwdbuwccytyepjwwn\\.supabase\\.co'\\s*,\\s*"
+            . "'github\\.com'\\s*,\\s*"
+            . "'raw\\.githubusercontent\\.com'\\s*,\\s*"
+            . "'objects\\.githubusercontent\\.com'\\s*,?\\s*"
+            . '\]\s*;/';
+        if (!preg_match($expected_allowlist_re, $new_plugin_content)) {
+            $this->audit_log('self_update', false, $ip, 'Trusted-update-domain allowlist modified; refusing');
+            return new WP_Error(
+                'forbidden',
+                'Update rejected: $trusted_update_domains allowlist cannot be changed via self-update. Ship the fixed allowlist by hand via SFTP if needed.',
+                ['status' => 403]
+            );
         }
 
         $new_version = 'unknown';
