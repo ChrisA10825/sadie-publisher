@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.4
+ * Version: 3.0.5
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,9 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.5 - Heartbeat now reports `trusted_update_domains` (the self-update
+ *         allowlist). Lets the fleet dashboard verify a client's domain
+ *         allowlist remotely without reading the PHP file.
  * 3.0.4 - Rebrand to "Sadie". New /seo-meta endpoint: update title, meta
  *         description, focus keyword, canonical, and robots/noindex on any
  *         post/page via Yoast/RankMath/AIOSEO. Supports lookup by slug or URL.
@@ -66,7 +69,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.4');
+define('SADIE_PUBLISHER_VERSION', '3.0.5');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1016,6 +1019,7 @@ class Sadie_Publisher {
             'seo_plugin' => $seo,
             'theme' => wp_get_theme()->get('Name'),
             'ssl' => is_ssl(),
+            'trusted_update_domains' => self::$trusted_update_domains,
             'posts' => [
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
