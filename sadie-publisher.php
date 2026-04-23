@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.5
+ * Version: 3.0.6
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,10 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.6 - Admin settings page now MASKS the API Key and Project Token in
+ *         the visible display (e.g. "sadie_ea7************"). The Copy
+ *         buttons still copy the full value, so nothing functional changes
+ *         — this only protects the shoulder-surf / screenshot surface.
  * 3.0.5 - Heartbeat now reports `trusted_update_domains` (the self-update
  *         allowlist). Lets the fleet dashboard verify a client's domain
  *         allowlist remotely without reading the PHP file.
@@ -69,7 +73,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.5');
+define('SADIE_PUBLISHER_VERSION', '3.0.6');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -230,6 +234,26 @@ class Sadie_Publisher {
         ';
     }
 
+    /**
+     * v3.0.6 — Mask a credential for display. Keeps the prefix (useful for
+     * identifying which site/key this is at a glance) but hides the secret
+     * body. Full value is still used by Copy buttons (onclick) so nothing
+     * breaks; the masking only protects the visual/screenshot surface.
+     * Example: "sadie_ea7dec55fb0412af0b..." -> "sadie_ea7************"
+     */
+    private function mask_secret($value) {
+        if (empty($value) || !is_string($value)) {
+            return '';
+        }
+        // Keep enough prefix to distinguish between sites; 9 chars covers
+        // "sadie_xxx" or "proj_xxxx" naming patterns.
+        $prefix_len = 9;
+        if (strlen($value) <= $prefix_len) {
+            return str_repeat('*', strlen($value));
+        }
+        return substr($value, 0, $prefix_len) . '************';
+    }
+
     public function render_settings_page() {
         $api_key = get_option($this->api_key_option);
         $project_token = get_option($this->project_token_option);
@@ -284,7 +308,7 @@ class Sadie_Publisher {
                     <tr>
                         <th>API Key</th>
                         <td>
-                            <span class="sadie-api-key" id="sadie-api-key"><?php echo esc_html($api_key); ?></span>
+                            <span class="sadie-api-key" id="sadie-api-key"><?php echo esc_html($this->mask_secret($api_key)); ?></span>
                             <button type="button" class="button button-small sadie-copy-btn" onclick="sadieCopy('<?php echo esc_js($api_key); ?>')">Copy</button>
                             <button type="button" class="button button-small" onclick="sadieRegenKey('api')">Regenerate</button>
                         </td>
@@ -292,7 +316,7 @@ class Sadie_Publisher {
                     <tr>
                         <th>Project Token</th>
                         <td>
-                            <span class="sadie-api-key" id="sadie-project-token"><?php echo esc_html($project_token); ?></span>
+                            <span class="sadie-api-key" id="sadie-project-token"><?php echo esc_html($this->mask_secret($project_token)); ?></span>
                             <button type="button" class="button button-small sadie-copy-btn" onclick="sadieCopy('<?php echo esc_js($project_token); ?>')">Copy</button>
                             <button type="button" class="button button-small" onclick="sadieRegenKey('project')">Regenerate</button>
                             <p class="description">Unique site identifier for the Blog Command Center.</p>
