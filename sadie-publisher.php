@@ -2327,6 +2327,214 @@ class Sadie_Publisher {
         ], 200);
     }
 
+    // =========================================================================
+    // v3.0.16 — SCHEMA (JSON-LD) set/clear + wp_head render
+    // =========================================================================
+
+    /**
+     * Render _sadie_schema post meta into the page <head> as JSON-LD.
+     * Only fires on singular pages + only when meta is non-empty + valid JSON.
+     */
+    public function render_sadie_schema() {
+        if (!is_singular()) return;
+        $post_id = get_queried_object_id();
+        if (!$post_id) return;
+        $schema = get_post_meta($post_id, '_sadie_schema', true);
+        if (empty($schema)) return;
+        // Sanity: must parse as JSON. Never emit raw HTML into head.
+        $decoded = json_decode($schema, true);
+        if (!is_array($decoded) && !is_object($decoded)) return;
+        // Re-encode to strip anything WP added and ensure clean JSON.
+        $clean = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($clean === false) return;
+        echo "\n<script type=\"application/ld+json\" data-source=\"sadie-publisher\">\n"
+            . $clean
+            . "\n</script>\n";
+    }
+
+    /**
+     * POST /sadie-publisher/v1/schema
+     * Body: { post_id|slug|url, schema_json, action: 'set'|'clear' }
+     * Stores JSON-LD in _sadie_schema; rendered by render_sadie_schema above.
+     */
+    public function handle_schema($request) {
+        $ip = $this->get_client_ip();
+        $params = $request->get_json_params() ?? [];
+        $post = $this->resolve_post($params);
+        if (is_wp_error($post)) {
+            $this->audit_log('schema', false, $ip, $post->get_error_message());
+            return $post;
+        }
+        $action = $params['action'] ?? 'set';
+        if ($action === 'clear') {
+            delete_post_meta($post->ID, '_sadie_schema');
+            $this->audit_log('schema', true, $ip, "Cleared schema for post {$post->ID}");
+            return new WP_REST_Response(['success' => true, 'action' => 'clear', 'post_id' => $post->ID], 200);
+        }
+
+        $raw = $params['schema_json'] ?? null;
+        // Accept either a JSON string or a decoded array/object.
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+        } else {
+            $decoded = $raw;
+        }
+        if (!is_array($decoded) && !is_object($decoded)) {
+            return new WP_Error('bad_request', 'schema_json must be a JSON object/array.', ['status' => 400]);
+        }
+        // Must contain an @type or be an array of typed objects.
+        $hasType = false;
+        if (is_array($decoded) && isset($decoded['@type'])) {
+            $hasType = true;
+        } elseif (is_array($decoded)) {
+            foreach ($decoded as $d) {
+                if (is_array($d) && isset($d['@type'])) { $hasType = true; break; }
+            }
+        }
+        if (!$hasType) {
+            return new WP_Error('bad_request', 'schema_json must include an @type (or be a graph of typed objects).', ['status' => 400]);
+        }
+
+        $clean = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        update_post_meta($post->ID, '_sadie_schema', $clean);
+        $this->audit_log('schema', true, $ip, "Set schema on post {$post->ID}");
+
+        return new WP_REST_Response([
+            'success' => true,
+            'action' => 'set',
+            'post_id' => $post->ID,
+            'url' => get_permalink($post->ID),
+            'hash' => hash('sha256', $clean),
+        ], 200);
+    }
+
+    // =========================================================================
+    // v3.0.16 — IMAGE ALT set + lookup
+    // =========================================================================
+
+    /**
+     * POST /sadie-publisher/v1/image-alt
+     * Body: { attachment_id | image_url, alt_text, force?: bool }
+     * - Media-library attachment: updates _wp_attachment_image_alt (clean).
+     * - Inline-HTML image (no attachment): returns requires_manual:true.
+     *   Pass force:true to rewrite the first <img src="..."> occurrence
+     *   in every post_content containing it (backed up to
+     *   _sadie_alt_backup_{timestamp} post meta first).
+     */
+    public function handle_image_alt($request) {
+        $ip = $this->get_client_ip();
+        $params = $request->get_json_params() ?? [];
+        $alt = isset($params['alt_text']) ? (string) $params['alt_text'] : null;
+        if ($alt === null) {
+            return new WP_Error('bad_request', 'alt_text required.', ['status' => 400]);
+        }
+        $alt = sanitize_text_field($alt);
+
+        $attachment_id = !empty($params['attachment_id']) ? absint($params['attachment_id']) : 0;
+        $image_url = !empty($params['image_url']) ? esc_url_raw((string) $params['image_url']) : '';
+
+        // Branch A: media-library attachment
+        if ($attachment_id || $image_url) {
+            if (!$attachment_id && $image_url) {
+                $attachment_id = attachment_url_to_postid($image_url);
+            }
+            if ($attachment_id) {
+                update_post_meta($attachment_id, '_wp_attachment_image_alt', $alt);
+                $this->audit_log('image_alt', true, $ip, "Attachment #{$attachment_id} alt updated");
+                return new WP_REST_Response([
+                    'success' => true,
+                    'attachment_id' => $attachment_id,
+                    'alt_text' => $alt,
+                    'is_media_library' => true,
+                ], 200);
+            }
+        }
+
+        // Branch B: inline-HTML image (no attachment)
+        if (!$image_url) {
+            return new WP_Error('bad_request', 'image_url required when not a media-library attachment.', ['status' => 400]);
+        }
+
+        $force = !empty($params['force']);
+        if (!$force) {
+            return new WP_REST_Response([
+                'success' => false,
+                'requires_manual' => true,
+                'image_url' => $image_url,
+                'reason' => 'Image is not a media-library attachment. Re-send with force:true to rewrite post_content in place (post backups will be saved).',
+            ], 200);
+        }
+
+        // Force mode: find every post referencing this URL and rewrite alt=.
+        $escaped = esc_url($image_url);
+        $like1 = '%' . $GLOBALS['wpdb']->esc_like($image_url) . '%';
+        $like2 = '%' . $GLOBALS['wpdb']->esc_like($escaped) . '%';
+        $posts = $GLOBALS['wpdb']->get_results(
+            $GLOBALS['wpdb']->prepare(
+                "SELECT ID, post_content FROM {$GLOBALS['wpdb']->posts}
+                 WHERE post_status IN ('publish','draft','private') AND (post_content LIKE %s OR post_content LIKE %s) LIMIT 200",
+                $like1, $like2
+            )
+        );
+
+        $touched = [];
+        $ts = time();
+        foreach ($posts as $p) {
+            // Back up
+            update_post_meta($p->ID, "_sadie_alt_backup_{$ts}", $p->post_content);
+            // Rewrite every <img> whose src matches. Simple regex — only
+            // replaces the alt attribute if present; injects one if missing.
+            $pattern = '/(<img\b[^>]*\bsrc=["\']' . preg_quote($image_url, '/') . '["\'][^>]*?)(\/?>)/i';
+            $new_content = preg_replace_callback($pattern, function ($m) use ($alt) {
+                $opener = $m[1];
+                $closer = $m[2];
+                $altAttr = 'alt="' . esc_attr($alt) . '"';
+                if (preg_match('/\balt=["\'][^"\']*["\']/i', $opener)) {
+                    $opener = preg_replace('/\balt=["\'][^"\']*["\']/i', $altAttr, $opener);
+                } else {
+                    $opener .= ' ' . $altAttr;
+                }
+                return $opener . $closer;
+            }, $p->post_content);
+            if ($new_content !== null && $new_content !== $p->post_content) {
+                wp_update_post(['ID' => $p->ID, 'post_content' => $new_content]);
+                $touched[] = $p->ID;
+            }
+        }
+        $this->audit_log('image_alt', !empty($touched), $ip,
+            'Inline-HTML rewrite for ' . $image_url . ' touched posts: ' . implode(',', $touched));
+        return new WP_REST_Response([
+            'success' => !empty($touched),
+            'requires_manual' => false,
+            'image_url' => $image_url,
+            'posts_touched' => $touched,
+            'backup_meta_key' => "_sadie_alt_backup_{$ts}",
+        ], 200);
+    }
+
+    /**
+     * POST/GET /sadie-publisher/v1/image-lookup
+     * Input: image_url (query or body)
+     * Output: { attachment_id: int|null, is_media_library: bool, current_alt?: string }
+     */
+    public function handle_image_lookup($request) {
+        $image_url = $request->get_param('image_url');
+        if (empty($image_url)) {
+            return new WP_Error('bad_request', 'image_url required.', ['status' => 400]);
+        }
+        $image_url = esc_url_raw((string) $image_url);
+        $attachment_id = attachment_url_to_postid($image_url);
+        $out = [
+            'image_url' => $image_url,
+            'attachment_id' => $attachment_id ?: null,
+            'is_media_library' => (bool) $attachment_id,
+        ];
+        if ($attachment_id) {
+            $out['current_alt'] = (string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+        }
+        return new WP_REST_Response($out, 200);
+    }
+
     /**
      * Resolve a WP_Post from { post_id, slug, or url }.
      */
