@@ -1,16 +1,19 @@
 <?php
 /**
- * Plugin Name: Sadie Publisher
+ * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
- * Description: Sadie's on-site agent. Content publishing, internal-link injection, page-state probe, and operational monitoring for Sadie SEO clients.
- * Version: 3.0.3
- * Author: Sadie SEO
+ * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
+ * Version: 3.0.4
+ * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
  * Requires PHP: 7.4
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.4 - Rebrand to "Sadie". New /seo-meta endpoint: update title, meta
+ *         description, focus keyword, canonical, and robots/noindex on any
+ *         post/page via Yoast/RankMath/AIOSEO. Supports lookup by slug or URL.
  * 3.0.3 - Security audit fixes (v3.0.2 shipped 2 exploit chains):
  *         - CRITICAL: /options POST now hard-allowlists keys. Previously
  *           a compromised API key could siteurl/template/active_plugins/
@@ -63,7 +66,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.3');
+define('SADIE_PUBLISHER_VERSION', '3.0.4');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -106,7 +109,7 @@ class Sadie_Publisher {
         if (version_compare(PHP_VERSION, SADIE_PUBLISHER_MIN_PHP, '<')) {
             deactivate_plugins(plugin_basename(__FILE__));
             wp_die(sprintf(
-                'Sadie Publisher requires PHP %s or higher. You are running PHP %s.',
+                'Sadie requires PHP %s or higher. You are running PHP %s.',
                 SADIE_PUBLISHER_MIN_PHP,
                 PHP_VERSION
             ));
@@ -160,8 +163,8 @@ class Sadie_Publisher {
 
     public function add_admin_menu() {
         add_options_page(
-            'Sadie Publisher',
-            'Sadie Publisher',
+            'Sadie',
+            'Sadie',
             'manage_options',
             'sadie-publisher',
             [$this, 'render_settings_page']
@@ -234,7 +237,7 @@ class Sadie_Publisher {
         $logs = array_slice(get_option($this->log_option, []), -20);
         ?>
         <div class="wrap sadie-wrap">
-            <h1>Sadie Publisher <small style="font-size:0.5em;color:#666;">v<?php echo esc_html(SADIE_PUBLISHER_VERSION); ?></small></h1>
+            <h1>Sadie <small style="font-size:0.5em;color:#666;">v<?php echo esc_html(SADIE_PUBLISHER_VERSION); ?></small></h1>
             <p>One-way content publishing from Blog Command Center. Receive-only — no outbound data.</p>
 
             <!-- Status Overview -->
@@ -521,6 +524,20 @@ class Sadie_Publisher {
         register_rest_route($ns, '/self-update', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_self_update'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // SEO meta — update title/description/robots on any post/page (v3.0.4)
+        register_rest_route($ns, '/seo-meta', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_seo_meta'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // SEO meta — bulk update multiple pages at once
+        register_rest_route($ns, '/seo-meta/bulk', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_seo_meta_bulk'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
     }
@@ -883,7 +900,7 @@ class Sadie_Publisher {
 
         return new WP_REST_Response([
             'success' => true,
-            'message' => 'Sadie Publisher is connected.',
+            'message' => 'Sadie is connected.',
             'version' => SADIE_PUBLISHER_VERSION,
             'site' => get_bloginfo('name'),
             'url' => home_url(),
@@ -1451,9 +1468,9 @@ class Sadie_Publisher {
             return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
         }
 
-        if (strpos($new_plugin_content, 'Plugin Name: Sadie Publisher') === false) {
+        if (strpos($new_plugin_content, 'Plugin Name: Sadie') === false) {
             $this->audit_log('self_update', false, $ip, 'Missing or wrong Plugin Name header');
-            return new WP_Error('bad_request', 'Plugin file missing valid "Plugin Name: Sadie Publisher" header.', ['status' => 400]);
+            return new WP_Error('bad_request', 'Plugin file missing valid "Plugin Name: Sadie" header.', ['status' => 400]);
         }
 
         $trimmed = ltrim($new_plugin_content);
@@ -1676,7 +1693,7 @@ class Sadie_Publisher {
         $sadie_meta = get_post_meta($post_id, '_sadie_published_at', true);
         if (empty($sadie_meta)) {
             $this->audit_log('delete', false, $ip, "Post #{$post_id} not a Sadie post");
-            return new WP_Error('forbidden', 'Can only delete posts created by Sadie Publisher.', ['status' => 403]);
+            return new WP_Error('forbidden', 'Can only delete posts created by Sadie.', ['status' => 403]);
         }
 
         $result = wp_delete_post($post_id, $force);
@@ -1924,6 +1941,222 @@ class Sadie_Publisher {
         // Schema markup
         if (!empty($seo['schema'])) {
             update_post_meta($post_id, '_sadie_schema', wp_kses_post($seo['schema']));
+        }
+    }
+
+    // =========================================================================
+    // SEO META ENDPOINT (v3.0.4)
+    // =========================================================================
+
+    /**
+     * POST /seo-meta — Update SEO meta on any post/page.
+     *
+     * Accepts: { post_id | slug | url, meta_title, meta_description,
+     *            focus_keyword, canonical_url, robots, og_title, og_description, schema }
+     *
+     * `robots` can be a string like "noindex,nofollow" or an object like
+     * { noindex: true, nofollow: false }. This writes to Yoast/RankMath/AIOSEO.
+     */
+    public function handle_seo_meta($request) {
+        $ip = $this->get_client_ip();
+        $body = $request->get_json_params();
+
+        // Resolve the post
+        $post = $this->resolve_post($body);
+        if (is_wp_error($post)) {
+            return $post;
+        }
+
+        $result = $this->apply_seo_meta($post->ID, $body);
+        $this->audit_log('seo_meta', true, $ip, "Updated SEO meta on post #{$post->ID} ({$post->post_title})");
+
+        return new WP_REST_Response([
+            'success' => true,
+            'post_id' => $post->ID,
+            'url' => get_permalink($post->ID),
+            'updated' => $result,
+        ], 200);
+    }
+
+    /**
+     * POST /seo-meta/bulk — Update SEO meta on multiple posts.
+     *
+     * Accepts: { items: [ { post_id | slug | url, meta_title, ... }, ... ] }
+     */
+    public function handle_seo_meta_bulk($request) {
+        $ip = $this->get_client_ip();
+        $body = $request->get_json_params();
+        $items = $body['items'] ?? [];
+
+        if (!is_array($items) || count($items) === 0) {
+            return new WP_Error('bad_request', 'items array is required.', ['status' => 400]);
+        }
+        if (count($items) > 50) {
+            return new WP_Error('bad_request', 'Maximum 50 items per bulk request.', ['status' => 400]);
+        }
+
+        $results = [];
+        $success = 0;
+        $failed = 0;
+
+        foreach ($items as $i => $item) {
+            $post = $this->resolve_post($item);
+            if (is_wp_error($post)) {
+                $results[] = ['index' => $i, 'success' => false, 'error' => $post->get_error_message()];
+                $failed++;
+                continue;
+            }
+            $updated = $this->apply_seo_meta($post->ID, $item);
+            $results[] = ['index' => $i, 'success' => true, 'post_id' => $post->ID, 'url' => get_permalink($post->ID), 'updated' => $updated];
+            $success++;
+        }
+
+        $this->audit_log('seo_meta_bulk', true, $ip, "Bulk SEO meta: {$success} ok, {$failed} failed");
+
+        return new WP_REST_Response([
+            'success' => true,
+            'processed' => count($items),
+            'succeeded' => $success,
+            'failed' => $failed,
+            'results' => $results,
+        ], 200);
+    }
+
+    /**
+     * Resolve a WP_Post from { post_id, slug, or url }.
+     */
+    private function resolve_post($params) {
+        // By explicit post_id
+        if (!empty($params['post_id'])) {
+            $post = get_post(absint($params['post_id']));
+            if (!$post) {
+                return new WP_Error('not_found', "Post #{$params['post_id']} not found.", ['status' => 404]);
+            }
+            return $post;
+        }
+
+        // By slug
+        if (!empty($params['slug'])) {
+            $slug = sanitize_title($params['slug']);
+            // Search posts and pages
+            $posts = get_posts([
+                'name' => $slug,
+                'post_type' => ['post', 'page', 'product'],
+                'post_status' => ['publish', 'draft', 'private'],
+                'numberposts' => 1,
+            ]);
+            if (empty($posts)) {
+                return new WP_Error('not_found', "No post found with slug '{$slug}'.", ['status' => 404]);
+            }
+            return $posts[0];
+        }
+
+        // By URL — extract the path and use url_to_postid
+        if (!empty($params['url'])) {
+            $url = esc_url_raw($params['url']);
+            $post_id = url_to_postid($url);
+            if ($post_id) {
+                return get_post($post_id);
+            }
+            // Fallback: try extracting slug from URL path
+            $path = trim(wp_parse_url($url, PHP_URL_PATH), '/');
+            $segments = explode('/', $path);
+            $slug = end($segments);
+            if ($slug) {
+                $posts = get_posts([
+                    'name' => sanitize_title($slug),
+                    'post_type' => ['post', 'page', 'product'],
+                    'post_status' => ['publish', 'draft', 'private'],
+                    'numberposts' => 1,
+                ]);
+                if (!empty($posts)) {
+                    return $posts[0];
+                }
+            }
+            return new WP_Error('not_found', "No post found for URL '{$url}'.", ['status' => 404]);
+        }
+
+        return new WP_Error('bad_request', 'Provide post_id, slug, or url.', ['status' => 400]);
+    }
+
+    /**
+     * Apply SEO meta fields to a post. Returns list of fields that were updated.
+     */
+    private function apply_seo_meta($post_id, $fields) {
+        $updated = [];
+
+        // Standard SEO fields — delegate to existing set_seo_meta
+        $seo_fields = [];
+        foreach (['meta_title', 'meta_description', 'focus_keyword', 'canonical_url', 'og_title', 'og_description', 'schema'] as $key) {
+            if (isset($fields[$key]) && $fields[$key] !== '') {
+                $seo_fields[$key] = $fields[$key];
+                $updated[] = $key;
+            }
+        }
+        if (!empty($seo_fields)) {
+            $this->set_seo_meta($post_id, $seo_fields);
+        }
+
+        // Robots / noindex — needs special handling per SEO plugin
+        if (isset($fields['robots'])) {
+            $this->set_robots_meta($post_id, $fields['robots']);
+            $updated[] = 'robots';
+        }
+
+        return $updated;
+    }
+
+    /**
+     * Set robots/noindex meta on a post via the detected SEO plugin.
+     *
+     * Accepts either:
+     *   - string: "noindex", "noindex,nofollow", "index,follow"
+     *   - object: { noindex: true, nofollow: false }
+     */
+    private function set_robots_meta($post_id, $robots) {
+        $settings = get_option($this->settings_option, []);
+        $seo_plugin = $settings['seo_plugin'] ?? 'auto';
+        if ($seo_plugin === 'auto') {
+            $seo_plugin = $this->detect_seo_plugin();
+        }
+
+        // Normalize to flags
+        $noindex = false;
+        $nofollow = false;
+        if (is_string($robots)) {
+            $lower = strtolower($robots);
+            $noindex = strpos($lower, 'noindex') !== false;
+            $nofollow = strpos($lower, 'nofollow') !== false;
+        } elseif (is_array($robots)) {
+            $noindex = !empty($robots['noindex']);
+            $nofollow = !empty($robots['nofollow']);
+        }
+
+        switch ($seo_plugin) {
+            case 'yoast':
+                // Yoast stores robots as _yoast_wpseo_meta-robots-noindex (1=noindex, 0=default)
+                // and _yoast_wpseo_meta-robots-nofollow (1=nofollow, 0=default)
+                update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', $noindex ? '1' : '0');
+                update_post_meta($post_id, '_yoast_wpseo_meta-robots-nofollow', $nofollow ? '1' : '0');
+                break;
+
+            case 'rankmath':
+                // RankMath stores robots as a serialized array in rank_math_robots
+                $rm_robots = [];
+                $rm_robots[] = $noindex ? 'noindex' : 'index';
+                $rm_robots[] = $nofollow ? 'nofollow' : 'follow';
+                update_post_meta($post_id, 'rank_math_robots', $rm_robots);
+                break;
+
+            case 'aioseo':
+                update_post_meta($post_id, '_aioseo_noindex', $noindex ? '1' : '0');
+                update_post_meta($post_id, '_aioseo_nofollow', $nofollow ? '1' : '0');
+                break;
+
+            default:
+                update_post_meta($post_id, '_sadie_robots_noindex', $noindex ? '1' : '0');
+                update_post_meta($post_id, '_sadie_robots_nofollow', $nofollow ? '1' : '0');
+                break;
         }
     }
 
