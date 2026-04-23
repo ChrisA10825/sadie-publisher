@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.16
+ * Version: 3.0.18
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -179,7 +179,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.16');
+define('SADIE_PUBLISHER_VERSION', '3.0.18');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -725,6 +725,16 @@ class Sadie_Publisher {
         register_rest_route($ns, '/image-lookup', [
             'methods' => ['GET', 'POST'],
             'callback' => [$this, 'handle_image_lookup'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.0.17: Deploy H1/H2 headings to a post.
+        //   post_title becomes the new H1 (most themes render it as such).
+        //   H2 replacements: array of { old, new } pairs, regex-replaced in
+        //   post_content. Empty "new" removes the <h2> wrapper.
+        register_rest_route($ns, '/headings', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_headings'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
     }
@@ -2535,6 +2545,124 @@ class Sadie_Publisher {
         return new WP_REST_Response($out, 200);
     }
 
+    // =========================================================================
+    // v3.0.17 — HEADINGS (H1 + H2) deploy
+    // =========================================================================
+
+    /**
+     * POST /sadie-publisher/v1/headings
+     *
+     * Body:
+     *   { post_id|slug|url, h1?: string, h2_replacements?: [{old, new}, ...] }
+     *
+     * H1: when present, replaces post_title (which most WP themes render as
+     *     the page's H1). The old title is stashed at _sadie_h1_backup so
+     *     rollback is a simple restore.
+     *
+     * H2: optional array of old→new rewrites inside post_content. We match
+     *     the exact H2 inner-text (case-insensitive, whitespace-collapsed)
+     *     and replace it in-place — leaving surrounding markup untouched.
+     *     An empty "new" unwraps the H2 (removes heading, keeps text).
+     */
+    public function handle_headings($request) {
+        $ip = $this->get_client_ip();
+        $body = $request->get_json_params();
+
+        $post = $this->resolve_post($body);
+        if (is_wp_error($post)) {
+            return $post;
+        }
+
+        $updated = [];
+        $skipped = [];
+
+        // ── H1 (post_title) ────────────────────────────────────────────────
+        if (isset($body['h1']) && is_string($body['h1']) && trim($body['h1']) !== '') {
+            $new_h1 = sanitize_text_field($body['h1']);
+            if ($new_h1 !== $post->post_title) {
+                // Backup current title once so rollback is deterministic
+                if (!get_post_meta($post->ID, '_sadie_h1_backup', true)) {
+                    update_post_meta($post->ID, '_sadie_h1_backup', $post->post_title);
+                }
+                $result = wp_update_post([
+                    'ID' => $post->ID,
+                    'post_title' => $new_h1,
+                ], true);
+                if (is_wp_error($result)) {
+                    return new WP_Error('h1_update_failed', $result->get_error_message(), ['status' => 500]);
+                }
+                $updated['h1'] = ['old' => $post->post_title, 'new' => $new_h1];
+            } else {
+                $skipped['h1'] = 'unchanged';
+            }
+        }
+
+        // ── H2 replacements ────────────────────────────────────────────────
+        $h2_ops = $body['h2_replacements'] ?? [];
+        if (is_array($h2_ops) && !empty($h2_ops)) {
+            $content = $post->post_content;
+            $original = $content;
+            $h2_results = [];
+
+            foreach ($h2_ops as $op) {
+                $old = isset($op['old']) ? (string) $op['old'] : '';
+                $new = isset($op['new']) ? (string) $op['new'] : '';
+                if ($old === '') {
+                    $h2_results[] = ['old' => $old, 'new' => $new, 'status' => 'bad_request'];
+                    continue;
+                }
+
+                // Match any <h2 ...>old</h2> (case-insensitive, whitespace-tolerant).
+                // Escape regex metacharacters in $old but keep flexibility for
+                // internal whitespace variance.
+                $escaped = preg_quote(trim($old), '/');
+                $escaped = preg_replace('/\s+/', '\s+', $escaped);
+                $pattern = '/(<h2\b[^>]*>)\s*' . $escaped . '\s*(<\/h2>)/i';
+
+                if (trim($new) === '') {
+                    // Unwrap: remove the <h2> entirely (including text).
+                    $replacement = '';
+                } else {
+                    $replacement = '$1' . esc_html(trim($new)) . '$2';
+                }
+                $count = 0;
+                $content = preg_replace($pattern, $replacement, $content, 1, $count);
+                $h2_results[] = [
+                    'old' => $old,
+                    'new' => $new,
+                    'matched' => $count,
+                ];
+            }
+
+            if ($content !== $original) {
+                // Backup previous content (once per post) for rollback.
+                if (!get_post_meta($post->ID, '_sadie_h2_backup', true)) {
+                    update_post_meta($post->ID, '_sadie_h2_backup', $original);
+                }
+                $result = wp_update_post([
+                    'ID' => $post->ID,
+                    'post_content' => $content,
+                ], true);
+                if (is_wp_error($result)) {
+                    return new WP_Error('h2_update_failed', $result->get_error_message(), ['status' => 500]);
+                }
+                $updated['h2_replacements'] = $h2_results;
+            } else {
+                $skipped['h2_replacements'] = $h2_results;
+            }
+        }
+
+        $this->audit_log('headings', true, $ip, "Updated headings on post #{$post->ID}");
+
+        return new WP_REST_Response([
+            'success' => true,
+            'post_id' => $post->ID,
+            'url' => get_permalink($post->ID),
+            'updated' => $updated,
+            'skipped' => $skipped,
+        ], 200);
+    }
+
     /**
      * Resolve a WP_Post from { post_id, slug, or url }.
      */
@@ -2564,15 +2692,39 @@ class Sadie_Publisher {
             return $posts[0];
         }
 
-        // By URL — extract the path and use url_to_postid
+        // By URL — extract the path and use url_to_postid.
+        //
+        // v3.0.18: reject archive URLs up front (/blog/, /category/*, /tag/*,
+        // /author/*, /?s=) — url_to_postid returns 0 for archives and the
+        // old slug-fallback would accidentally match a random post of the
+        // same slug (e.g. any post named "blog"), quietly writing the
+        // archive's "proposal" into the wrong post.
+        //
+        // For the slug-fallback to fire, the resolved post's permalink must
+        // actually match the submitted URL. Otherwise we 404 rather than
+        // silently scribble on the wrong record.
         if (!empty($params['url'])) {
             $url = esc_url_raw($params['url']);
             $post_id = url_to_postid($url);
             if ($post_id) {
                 return get_post($post_id);
             }
-            // Fallback: try extracting slug from URL path
+
             $path = trim(wp_parse_url($url, PHP_URL_PATH), '/');
+            // Archive-style URLs never resolve to a single editable post.
+            $archive_prefixes = ['blog', 'category', 'tag', 'author', 'page'];
+            $first_segment = explode('/', $path)[0] ?? '';
+            $is_archive = $path === '' || in_array($first_segment, $archive_prefixes, true);
+            if ($is_archive) {
+                return new WP_Error(
+                    'archive_url',
+                    "URL '{$url}' is an archive/listing page with no editable post_id. Update the theme/Yoast archive settings directly.",
+                    ['status' => 400]
+                );
+            }
+
+            // Slug fallback — but only when the candidate's own permalink
+            // matches the submitted URL. Prevents false matches.
             $segments = explode('/', $path);
             $slug = end($segments);
             if ($slug) {
@@ -2580,10 +2732,13 @@ class Sadie_Publisher {
                     'name' => sanitize_title($slug),
                     'post_type' => ['post', 'page', 'product'],
                     'post_status' => ['publish', 'draft', 'private'],
-                    'numberposts' => 1,
+                    'numberposts' => 5,
                 ]);
-                if (!empty($posts)) {
-                    return $posts[0];
+                foreach ($posts as $candidate) {
+                    $cand_url = get_permalink($candidate->ID);
+                    if ($cand_url && rtrim($cand_url, '/') === rtrim($url, '/')) {
+                        return $candidate;
+                    }
                 }
             }
             return new WP_Error('not_found', "No post found for URL '{$url}'.", ['status' => 404]);
