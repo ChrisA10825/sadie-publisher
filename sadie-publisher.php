@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.9
+ * Version: 3.0.10
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,11 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.10 - Heartbeat now reports `php_limits` (upload_max_filesize,
+ *          post_max_size, memory_limit). Lets the fleet dashboard flag
+ *          clients whose host config would block large blog publishes
+ *          or big image sideloads. First release genuinely shipped end-
+ *          to-end via self-update after v3.0.9 unblocked the fleet.
  * 3.0.9 - Bulletproof self-update path:
  *         - Drop stream+filename args from wp_safe_remote_get; use plain
  *           GET + body. SG PHP was silently fataling on the streaming
@@ -97,7 +102,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.9');
+define('SADIE_PUBLISHER_VERSION', '3.0.10');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1069,6 +1074,11 @@ class Sadie_Publisher {
             'ssl' => is_ssl(),
             'trusted_update_domains' => self::$trusted_update_domains,
             'last_self_update' => get_option('sadie_publisher_last_self_update', null),
+            'php_limits' => [
+                'upload_max_filesize' => ini_get('upload_max_filesize'),
+                'post_max_size'       => ini_get('post_max_size'),
+                'memory_limit'        => ini_get('memory_limit'),
+            ],
             'posts' => [
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
