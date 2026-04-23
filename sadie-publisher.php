@@ -2746,7 +2746,32 @@ add_action('wp_ajax_sadie_regenerate_key', function() {
         update_option('sadie_publisher_api_key', $new_key);
     }
 
-    wp_send_json_success(['key' => $new_key]);
+    // v3.0.11 — return only the masked form to the UI. The raw value is
+    // fetched separately via sadie_get_cred on Copy click.
+    $masked = strlen($new_key) > 9 ? substr($new_key, 0, 9) . '************' : str_repeat('*', strlen($new_key));
+    wp_send_json_success(['masked' => $masked]);
+});
+
+// v3.0.11 — AJAX: reveal credential on admin Copy click. Admin-only,
+// nonce-protected. Keeps the raw key out of the rendered HTML so view-
+// source / dev-tools inspection can't leak it. Same auth surface as
+// regeneration (manage_options + WP nonce).
+add_action('wp_ajax_sadie_get_cred', function() {
+    check_ajax_referer('sadie_get_cred');
+
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Unauthorized.']);
+    }
+
+    $type = sanitize_text_field($_POST['type'] ?? 'api');
+    $option = ($type === 'project') ? 'sadie_publisher_project_token' : 'sadie_publisher_api_key';
+    $value = get_option($option, '');
+
+    if (empty($value)) {
+        wp_send_json_error(['message' => 'Credential not set.']);
+    }
+
+    wp_send_json_success(['value' => $value]);
 });
 
 // v3.0.11 — AJAX: return raw credential on-demand for Copy buttons so the
