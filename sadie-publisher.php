@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.11
+ * Version: 3.0.12
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,25 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.12 - Defensive diagnostics on self-update. Previous versions
+ *          silently fataled mid-validate_and_apply_update on SiteGround
+ *          (empty HTTP 200, only "Wrote tempfile" in audit log). This
+ *          release makes the fatal visible:
+ *          - try/catch (Throwable) wrapper around the whole validate
+ *            function — any Error or Exception is caught and logged
+ *            with class + message + line.
+ *          - Per-step SUCCESS audit_log entries: zip opened, entries
+ *            scanned, plugin name verified, scanners passed, allowlist
+ *            verified, write prepared, bytes written, opcache flushed,
+ *            smoke test started, smoke test passed. Reading the audit
+ *            log alone now localizes any future crash to a single step.
+ *          - Dropped WP_Filesystem. Uses native file_put_contents on
+ *            the plugin path directly (the plugin is already running
+ *            from that dir, so it's writable). Removes the FS_METHOD
+ *            detection path that may hang on some SG configs.
+ *          - Optional `skip_smoke_test: true` in POST body bypasses the
+ *            self-loopback smoke test. Useful when /wp-json/ self-fetch
+ *            is blocked by CF/WAF on a specific client.
  * 3.0.11 - Two fixes:
  *          1. AJAX Copy buttons. The Copy button now fetches the raw
  *             credential from a new /creds endpoint on click instead of
@@ -116,7 +135,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.11');
+define('SADIE_PUBLISHER_VERSION', '3.0.12');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1534,7 +1553,8 @@ class Sadie_Publisher {
         }
         $this->audit_log('self_update', true, $ip, "Wrote tempfile ({$tmp_file}), running validate_and_apply_update");
 
-        $result = $this->validate_and_apply_update($tmp_file, $ip);
+        $skip_smoke_test = !empty($params['skip_smoke_test']);
+        $result = $this->validate_and_apply_update($tmp_file, $ip, $skip_smoke_test);
         @unlink($tmp_file);
 
         if (is_wp_error($result)) {
@@ -1553,13 +1573,34 @@ class Sadie_Publisher {
         return new WP_REST_Response($result, 200);
     }
 
-    private function validate_and_apply_update($zip_path, $ip) {
+    private function validate_and_apply_update($zip_path, $ip, $skip_smoke_test = false) {
+        // v3.0.12 — wrap everything in Throwable-catch so silent fatals
+        // surface in the audit log. Prior versions let PHP Error/Exception
+        // collapse into an empty HTTP 200, hiding the cause.
+        try {
+            return $this->validate_and_apply_update_inner($zip_path, $ip, $skip_smoke_test);
+        } catch (\Throwable $e) {
+            $this->audit_log(
+                'self_update', false, $ip,
+                'EXCEPTION ' . get_class($e) . ': ' . $e->getMessage()
+                . ' at ' . basename($e->getFile()) . ':' . $e->getLine()
+            );
+            return new WP_Error(
+                'exception',
+                'Self-update threw ' . get_class($e) . ': ' . $e->getMessage(),
+                ['status' => 500]
+            );
+        }
+    }
+
+    private function validate_and_apply_update_inner($zip_path, $ip, $skip_smoke_test) {
         $zip = new ZipArchive();
         $open_result = $zip->open($zip_path, ZipArchive::RDONLY);
         if ($open_result !== true) {
-            $this->audit_log('self_update', false, $ip, 'Invalid ZIP archive');
+            $this->audit_log('self_update', false, $ip, 'Invalid ZIP archive (open code ' . $open_result . ')');
             return new WP_Error('bad_request', 'Invalid ZIP archive.', ['status' => 400]);
         }
+        $this->audit_log('self_update', true, $ip, "ZIP opened ({$zip->numFiles} entries)");
 
         $valid_entries = [];
         $has_plugin_file = false;
@@ -1602,6 +1643,7 @@ class Sadie_Publisher {
             $this->audit_log('self_update', false, $ip, 'Could not read plugin file from ZIP or file too small');
             return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
         }
+        $this->audit_log('self_update', true, $ip, 'Extracted plugin file (' . strlen($new_plugin_content) . ' bytes)');
 
         if (strpos($new_plugin_content, 'Plugin Name: Sadie') === false) {
             $this->audit_log('self_update', false, $ip, 'Missing or wrong Plugin Name header');
@@ -1613,6 +1655,7 @@ class Sadie_Publisher {
             $this->audit_log('self_update', false, $ip, 'File does not start with <?php');
             return new WP_Error('bad_request', 'Plugin file must start with <?php.', ['status' => 400]);
         }
+        $this->audit_log('self_update', true, $ip, 'Plugin header + <?php prefix OK');
 
         // v3.0.11 — strip PHP comments before scanning. Simpler than
         // the v3.0.9 tokenizer (which caused a silent fatal on SG PHP),
@@ -1659,6 +1702,7 @@ class Sadie_Publisher {
                 return new WP_Error('forbidden', "Plugin file contains forbidden pattern: {$func}()", ['status' => 403]);
             }
         }
+        $this->audit_log('self_update', true, $ip, 'Dangerous-function scan passed');
 
         // v3.0.11 — removed the include/require, backtick, variable-
         // function, preg_replace/e, php://, and file_get_contents fuzzy
@@ -1688,41 +1732,49 @@ class Sadie_Publisher {
                 ['status' => 403]
             );
         }
+        $this->audit_log('self_update', true, $ip, 'Persistent-backdoor allowlist verified');
 
         $new_version = 'unknown';
         if (preg_match('/\*\s*Version:\s*([0-9]+\.[0-9]+\.[0-9]+)/', $new_plugin_content, $m)) {
             $new_version = $m[1];
         }
 
-        if (!function_exists('WP_Filesystem')) {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-        }
-        WP_Filesystem();
-        global $wp_filesystem;
-
-        if (!$wp_filesystem) {
-            $this->audit_log('self_update', false, $ip, 'WP_Filesystem not available');
-            return new WP_Error('server_error', 'Filesystem access not available.', ['status' => 500]);
-        }
-
+        // v3.0.12 — use native file_put_contents instead of WP_Filesystem.
+        // The plugin is already running from plugin_dir_path, so the dir is
+        // obviously writable by this PHP process. WP_Filesystem's
+        // get_filesystem_method() adds an FTP-mode detection path that can
+        // hang silently on some SiteGround configs — suspected source of
+        // the empty-200 fatals.
         $plugin_file = plugin_dir_path(__FILE__) . 'sadie-publisher.php';
         $backup_file = plugin_dir_path(__FILE__) . 'sadie-publisher.php.backup';
 
-        if ($wp_filesystem->exists($plugin_file)) {
-            $current_content = $wp_filesystem->get_contents($plugin_file);
-            if (!$wp_filesystem->put_contents($backup_file, $current_content, FS_CHMOD_FILE)) {
-                $this->audit_log('self_update', false, $ip, 'Failed to create backup');
+        if (!is_writable(dirname($plugin_file))) {
+            $this->audit_log('self_update', false, $ip, 'Plugin dir not writable: ' . dirname($plugin_file));
+            return new WP_Error('server_error', 'Plugin directory is not writable.', ['status' => 500]);
+        }
+
+        if (file_exists($plugin_file)) {
+            $current_content = @file_get_contents($plugin_file);
+            if ($current_content === false) {
+                $this->audit_log('self_update', false, $ip, 'Could not read existing plugin file');
+                return new WP_Error('server_error', 'Failed to read current plugin file.', ['status' => 500]);
+            }
+            if (@file_put_contents($backup_file, $current_content) === false) {
+                $this->audit_log('self_update', false, $ip, 'Failed to create backup at ' . $backup_file);
                 return new WP_Error('server_error', 'Failed to create backup.', ['status' => 500]);
             }
         }
+        $this->audit_log('self_update', true, $ip, 'Backup created, writing new plugin file');
 
-        if (!$wp_filesystem->put_contents($plugin_file, $new_plugin_content, FS_CHMOD_FILE)) {
-            if ($wp_filesystem->exists($backup_file)) {
-                $wp_filesystem->put_contents($plugin_file, $wp_filesystem->get_contents($backup_file), FS_CHMOD_FILE);
+        $wrote = @file_put_contents($plugin_file, $new_plugin_content);
+        if ($wrote === false || $wrote !== strlen($new_plugin_content)) {
+            if (file_exists($backup_file)) {
+                @file_put_contents($plugin_file, @file_get_contents($backup_file));
             }
-            $this->audit_log('self_update', false, $ip, 'Failed to write new plugin file');
+            $this->audit_log('self_update', false, $ip, "Failed to write new plugin file (wrote={$wrote}, expected=" . strlen($new_plugin_content) . ')');
             return new WP_Error('server_error', 'Failed to write update. Previous version restored.', ['status' => 500]);
         }
+        $this->audit_log('self_update', true, $ip, "Wrote {$wrote} bytes to {$plugin_file}");
 
         // Force OpCache to invalidate the new file so subsequent requests load
         // fresh opcodes. Without this, PHP-FPM hosts with
@@ -1730,6 +1782,9 @@ class Sadie_Publisher {
         // even though the file on disk is new.
         if (function_exists('opcache_invalidate')) {
             @opcache_invalidate($plugin_file, true);
+            $this->audit_log('self_update', true, $ip, 'opcache_invalidate called');
+        } else {
+            $this->audit_log('self_update', true, $ip, 'opcache_invalidate not available (skipped)');
         }
 
         // Post-swap smoke test: self-curl /wp-json/ (the REST root — no auth
@@ -1742,38 +1797,45 @@ class Sadie_Publisher {
         // unsigned probes got 401, which older versions mis-classified as
         // "failure" and rolled back every self-update. Root-probing dodges
         // the auth layer entirely.
-        $probe_url = home_url('/wp-json/');
-        $smoke_ok = false;
-        $smoke_info = '';
-        for ($attempt = 1; $attempt <= 3; $attempt++) {
-            $smoke = wp_remote_get($probe_url, [
-                'timeout' => 10,
-                'sslverify' => apply_filters('sadie_smoke_test_sslverify', true),
-            ]);
-            $code = is_wp_error($smoke) ? 0 : (int) wp_remote_retrieve_response_code($smoke);
-            $smoke_info = is_wp_error($smoke)
-                ? ('wp_error: ' . $smoke->get_error_message())
-                : ('HTTP ' . $code);
-            if (!is_wp_error($smoke) && $code > 0 && $code < 500) {
-                $smoke_ok = true;
-                break;
-            }
-            if ($attempt < 3) usleep(2_000_000); // 2s
-        }
-
-        if (!$smoke_ok) {
-            if ($wp_filesystem->exists($backup_file)) {
-                $wp_filesystem->put_contents($plugin_file, $wp_filesystem->get_contents($backup_file), FS_CHMOD_FILE);
-                $wp_filesystem->delete($backup_file);
-                if (function_exists('opcache_invalidate')) {
-                    @opcache_invalidate($plugin_file, true);
+        if ($skip_smoke_test) {
+            $this->audit_log('self_update', true, $ip, 'Smoke test skipped (skip_smoke_test=true)');
+            $smoke_info = 'skipped';
+        } else {
+            $probe_url = home_url('/wp-json/');
+            $smoke_ok = false;
+            $smoke_info = '';
+            $this->audit_log('self_update', true, $ip, "Smoke test starting against {$probe_url}");
+            for ($attempt = 1; $attempt <= 3; $attempt++) {
+                $smoke = wp_remote_get($probe_url, [
+                    'timeout' => 10,
+                    'sslverify' => apply_filters('sadie_smoke_test_sslverify', true),
+                ]);
+                $code = is_wp_error($smoke) ? 0 : (int) wp_remote_retrieve_response_code($smoke);
+                $smoke_info = is_wp_error($smoke)
+                    ? ('wp_error: ' . $smoke->get_error_message())
+                    : ('HTTP ' . $code);
+                if (!is_wp_error($smoke) && $code > 0 && $code < 500) {
+                    $smoke_ok = true;
+                    break;
                 }
+                if ($attempt < 3) usleep(2_000_000); // 2s
             }
-            $this->audit_log('self_update', false, $ip, "Smoke test failed ({$smoke_info}); rolled back");
-            return new WP_Error('smoke_test_failed', "Smoke test failed after update: {$smoke_info}. Rolled back.", ['status' => 500]);
+
+            if (!$smoke_ok) {
+                if (file_exists($backup_file)) {
+                    @file_put_contents($plugin_file, @file_get_contents($backup_file));
+                    @unlink($backup_file);
+                    if (function_exists('opcache_invalidate')) {
+                        @opcache_invalidate($plugin_file, true);
+                    }
+                }
+                $this->audit_log('self_update', false, $ip, "Smoke test failed ({$smoke_info}); rolled back");
+                return new WP_Error('smoke_test_failed', "Smoke test failed after update: {$smoke_info}. Rolled back.", ['status' => 500]);
+            }
+            $this->audit_log('self_update', true, $ip, "Smoke test passed ({$smoke_info})");
         }
 
-        $wp_filesystem->delete($backup_file);
+        @unlink($backup_file);
 
         $this->audit_log('self_update', true, $ip, "Updated to v{$new_version} from v" . SADIE_PUBLISHER_VERSION . " (smoke: {$smoke_info})");
 
