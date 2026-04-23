@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.7
+ * Version: 3.0.8
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,12 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.8 - Heartbeat now reports `last_self_update` — a compact record
+ *         of the most recent successful self-update (timestamp, from
+ *         version, to version, zip host). Lets the fleet dashboard
+ *         confirm a rollout landed without parsing the full audit log.
+ *         Also: first version shipped end-to-end via self-update (no
+ *         manual upload) after the v3.0.7 bootstrap fix.
  * 3.0.7 - CRITICAL FIX: self-update now require_once's wp-admin/includes/
  *         file.php before calling wp_tempnam() / WP_Filesystem(). Those
  *         helpers are NOT auto-loaded on REST requests on many hosts
@@ -80,7 +86,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.7');
+define('SADIE_PUBLISHER_VERSION', '3.0.8');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1051,6 +1057,7 @@ class Sadie_Publisher {
             'theme' => wp_get_theme()->get('Name'),
             'ssl' => is_ssl(),
             'trusted_update_domains' => self::$trusted_update_domains,
+            'last_self_update' => get_option('sadie_publisher_last_self_update', null),
             'posts' => [
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
@@ -1460,6 +1467,15 @@ class Sadie_Publisher {
         if (is_wp_error($result)) {
             return $result;
         }
+
+        // v3.0.8: record the most recent successful self-update so the
+        // heartbeat can surface it without parsing the full audit log.
+        update_option('sadie_publisher_last_self_update', [
+            'time'             => current_time('c'),
+            'previous_version' => $result['previous_version'] ?? null,
+            'new_version'      => $result['new_version'] ?? null,
+            'zip_host'         => $host,
+        ]);
 
         return new WP_REST_Response($result, 200);
     }
