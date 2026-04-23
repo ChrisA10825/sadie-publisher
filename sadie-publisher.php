@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.15
+ * Version: 3.0.16
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,31 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.16 - Schema + image alt deploy endpoints (unblocks the SEO
+ *          module's Schema and Image Alt features):
+ *          - Added wp_head hook that renders _sadie_schema post meta
+ *            as <script type="application/ld+json"> in the page head.
+ *            Schema written via /seo-meta or /schema is now actually
+ *            visible to Google; the prior versions stored it but never
+ *            emitted it.
+ *          - New /sadie-publisher/v1/schema endpoint. POST sets schema
+ *            for a single post (body: {post_id|slug|url, schema_json,
+ *            action:'set'|'clear'}). Validates that the payload is
+ *            valid JSON with a recognized @type; refuses malformed
+ *            input to prevent bricking Google's rich-results parser.
+ *          - New /sadie-publisher/v1/image-alt endpoint. POST sets
+ *            alt text for a single attachment (body: {attachment_id
+ *            OR image_url, alt_text}). Uses attachment_url_to_postid
+ *            to resolve URLs. Inline-HTML images (images in post
+ *            content not backed by an attachment) return
+ *            requires_manual:true and do not modify post_content
+ *            unless force:true is passed, in which case the original
+ *            post_content is backed up to a _sadie_alt_backup_{ts}
+ *            post meta before rewriting.
+ *          - New /sadie-publisher/v1/image-lookup endpoint. GET or
+ *            POST resolves an image_url to attachment_id + is_media_library
+ *            flag so the SEO crawler can pre-classify images before
+ *            generating alt proposals.
  * 3.0.15 - First release shipped end-to-end via self-update after the
  *          v3.0.14 PclZip fix. Closes the self-update saga. Heartbeat
  *          gains `zip_backend` — "ZipArchive" or "PclZip" — recorded on
@@ -154,7 +179,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.15');
+define('SADIE_PUBLISHER_VERSION', '3.0.16');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -183,6 +208,8 @@ class Sadie_Publisher {
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('rest_api_init', [$this, 'register_rest_routes']);
+        // v3.0.16: render _sadie_schema post meta into <head> on singular pages.
+        add_action('wp_head', [$this, 'render_sadie_schema'], 20);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_scripts']);
 
         register_activation_hook(__FILE__, [$this, 'activate']);
@@ -677,6 +704,27 @@ class Sadie_Publisher {
         register_rest_route($ns, '/seo-meta/bulk', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_seo_meta_bulk'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.0.16: Schema (JSON-LD) set/clear for a single post.
+        register_rest_route($ns, '/schema', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_schema'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.0.16: Image alt text set for a single attachment (or inline image with force).
+        register_rest_route($ns, '/image-alt', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_image_alt'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.0.16: Resolve image URL → attachment ID + is-media-library flag.
+        register_rest_route($ns, '/image-lookup', [
+            'methods' => ['GET', 'POST'],
+            'callback' => [$this, 'handle_image_lookup'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
     }
