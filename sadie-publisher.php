@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.6
+ * Version: 3.0.7
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,13 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.7 - CRITICAL FIX: self-update now require_once's wp-admin/includes/
+ *         file.php before calling wp_tempnam() / WP_Filesystem(). Those
+ *         helpers are NOT auto-loaded on REST requests on many hosts
+ *         (confirmed silent fatal on SiteGround: TBH v3.0.4 -> v3.0.5
+ *         push returned HTTP 200 empty body, only "Update initiated" in
+ *         audit log). v3.0.3/3.0.4/3.0.5/3.0.6 self-update silently
+ *         PHP-fataled every time. This unlocks self-update fleet-wide.
  * 3.0.6 - Admin settings page now MASKS the API Key and Project Token in
  *         the visible display (e.g. "sadie_ea7************"). The Copy
  *         buttons still copy the full value, so nothing functional changes
@@ -73,7 +80,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.6');
+define('SADIE_PUBLISHER_VERSION', '3.0.7');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1359,6 +1366,17 @@ class Sadie_Publisher {
     ];
 
     public function handle_self_update($request) {
+        // v3.0.6: wp-admin/includes/file.php defines wp_tempnam() and
+        // WP_Filesystem(), both used below. REST requests don't auto-load
+        // this file, so on hosts where it's not already in scope the call
+        // to wp_tempnam() inside wp_safe_remote_get's 'filename' arg would
+        // fatal silently (PHP Fatal -> 200 headers already sent -> empty
+        // body -> only "Update initiated" in audit log). Loading it up
+        // front is the single-line fix that unlocks self-update fleet-wide.
+        if (!function_exists('wp_tempnam') || !function_exists('WP_Filesystem')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+
         $ip = $this->get_client_ip();
         $params = $request->get_json_params();
         $zip_url = $params['zip_url'] ?? '';
