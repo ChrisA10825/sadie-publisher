@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.12
+ * Version: 3.0.13
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,11 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.13 - First release shipped end-to-end via self-update (the proof
+ *          that v3.0.12's diagnostic fixes actually worked). Only change
+ *          is heartbeat now reports `plugin_file_hash` — SHA256 of the
+ *          installed sadie-publisher.php file. Lets the fleet dashboard
+ *          detect tampering or version drift without pulling the file.
  * 3.0.12 - Defensive diagnostics on self-update. Previous versions
  *          silently fataled mid-validate_and_apply_update on SiteGround
  *          (empty HTTP 200, only "Wrote tempfile" in audit log). This
@@ -135,7 +140,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.12');
+define('SADIE_PUBLISHER_VERSION', '3.0.13');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1143,6 +1148,7 @@ class Sadie_Publisher {
                 'post_max_size'       => ini_get('post_max_size'),
                 'memory_limit'        => ini_get('memory_limit'),
             ],
+            'plugin_file_hash' => @hash_file('sha256', __FILE__) ?: null,
             'posts' => [
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
