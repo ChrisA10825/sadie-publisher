@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.14
+ * Version: 3.0.15
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,11 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.15 - First release shipped end-to-end via self-update after the
+ *          v3.0.14 PclZip fix. Closes the self-update saga. Heartbeat
+ *          gains `zip_backend` — "ZipArchive" or "PclZip" — recorded on
+ *          the last successful update so the fleet dashboard can flag
+ *          which clients run on which zip path.
  * 3.0.14 - ROOT CAUSE FOUND + FIXED. v3.0.12's Throwable-catch on TBH
  *          surfaced the real fatal: `Class "ZipArchive" not found`. SG's
  *          PHP build doesn't load the php-zip PECL extension in REST
@@ -149,7 +154,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.14');
+define('SADIE_PUBLISHER_VERSION', '3.0.15');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1158,6 +1163,7 @@ class Sadie_Publisher {
                 'memory_limit'        => ini_get('memory_limit'),
             ],
             'plugin_file_hash' => @hash_file('sha256', __FILE__) ?: null,
+            'zip_backend' => class_exists('ZipArchive') ? 'ZipArchive' : 'PclZip',
             'posts' => [
                 'published' => $post_counts->publish ?? 0,
                 'draft' => $post_counts->draft ?? 0,
