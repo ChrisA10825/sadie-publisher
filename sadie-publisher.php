@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.13
+ * Version: 3.0.14
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,11 +11,20 @@
  * Requires at least: 5.8
  *
  * Changelog:
- * 3.0.13 - First release shipped end-to-end via self-update (the proof
- *          that v3.0.12's diagnostic fixes actually worked). Only change
- *          is heartbeat now reports `plugin_file_hash` — SHA256 of the
- *          installed sadie-publisher.php file. Lets the fleet dashboard
- *          detect tampering or version drift without pulling the file.
+ * 3.0.14 - ROOT CAUSE FOUND + FIXED. v3.0.12's Throwable-catch on TBH
+ *          surfaced the real fatal: `Class "ZipArchive" not found`. SG's
+ *          PHP build doesn't load the php-zip PECL extension in REST
+ *          context. That's why WP's own Plugin Uploader worked (it uses
+ *          unzip_file() which falls back to PclZip — a pure-PHP ZIP
+ *          library bundled with WordPress) but our direct ZipArchive
+ *          usage silently fataled every time.
+ *          Fix: prefer ZipArchive when available, fall back to PclZip
+ *          (always available — ships in wp-admin/includes/class-pclzip.php
+ *          since WP 2.6). Self-update now works on SG.
+ * 3.0.13 - Intended as first self-update release; turned into the
+ *          diagnostic smoking gun instead. heartbeat reports
+ *          `plugin_file_hash` — SHA256 of the installed plugin file,
+ *          for fleet-dashboard tamper/version-drift detection.
  * 3.0.12 - Defensive diagnostics on self-update. Previous versions
  *          silently fataled mid-validate_and_apply_update on SiteGround
  *          (empty HTTP 200, only "Wrote tempfile" in audit log). This
@@ -140,7 +149,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.13');
+define('SADIE_PUBLISHER_VERSION', '3.0.14');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1579,6 +1588,109 @@ class Sadie_Publisher {
         return new WP_REST_Response($result, 200);
     }
 
+    /**
+     * v3.0.14 — extract the single expected sadie-publisher.php entry from
+     * the downloaded zip. Uses ZipArchive if available, falls back to
+     * PclZip (pure-PHP, ships with WordPress since 2.6). Applies the same
+     * safety checks regardless of backend: no path traversal, only
+     * sadie-publisher.php files allowed, exactly one plugin file found.
+     *
+     * Returns plugin file content (string) on success, WP_Error on failure.
+     */
+    private function extract_plugin_php_from_zip($zip_path, $ip) {
+        // ---- ZipArchive path (preferred when PECL zip is loaded) ----
+        if (class_exists('ZipArchive')) {
+            $zip = new ZipArchive();
+            $open_result = $zip->open($zip_path, ZipArchive::RDONLY);
+            if ($open_result !== true) {
+                $this->audit_log('self_update', false, $ip, 'Invalid ZIP archive (open code ' . $open_result . ')');
+                return new WP_Error('bad_request', 'Invalid ZIP archive.', ['status' => 400]);
+            }
+            $this->audit_log('self_update', true, $ip, "ZIP opened via ZipArchive ({$zip->numFiles} entries)");
+
+            $plugin_entry = null;
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $entry = $zip->getNameIndex($i);
+                if (substr($entry, -1) === '/' || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
+                    continue;
+                }
+                if (strpos($entry, '..') !== false || strpos($entry, '\\') !== false) {
+                    $zip->close();
+                    $this->audit_log('self_update', false, $ip, "Path traversal attempt: {$entry}");
+                    return new WP_Error('forbidden', 'Invalid file path in archive.', ['status' => 403]);
+                }
+                if (basename($entry) === 'sadie-publisher.php') {
+                    $plugin_entry = $entry;
+                } else {
+                    $zip->close();
+                    $this->audit_log('self_update', false, $ip, "Unexpected file in ZIP: {$entry}");
+                    return new WP_Error('bad_request', "Unexpected file in archive: " . basename($entry), ['status' => 400]);
+                }
+            }
+            if ($plugin_entry === null) {
+                $zip->close();
+                $this->audit_log('self_update', false, $ip, 'ZIP missing sadie-publisher.php');
+                return new WP_Error('bad_request', 'Archive must contain sadie-publisher.php.', ['status' => 400]);
+            }
+            $content = $zip->getFromName($plugin_entry);
+            $zip->close();
+            if ($content === false || strlen($content) < 100) {
+                $this->audit_log('self_update', false, $ip, 'Could not read plugin file from ZIP or file too small');
+                return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
+            }
+            return $content;
+        }
+
+        // ---- PclZip fallback (pure PHP, always works) ----
+        $this->audit_log('self_update', true, $ip, 'ZipArchive unavailable; using PclZip fallback');
+        if (!class_exists('PclZip')) {
+            require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+        }
+        $pclzip = new PclZip($zip_path);
+        $list = $pclzip->listContent();
+        if (!is_array($list) || empty($list)) {
+            $this->audit_log('self_update', false, $ip, 'PclZip could not list archive contents');
+            return new WP_Error('bad_request', 'Invalid ZIP archive (PclZip).', ['status' => 400]);
+        }
+        $this->audit_log('self_update', true, $ip, "ZIP opened via PclZip (" . count($list) . " entries)");
+
+        $plugin_entry = null;
+        foreach ($list as $entry) {
+            $name = $entry['filename'] ?? '';
+            if (empty($name)) continue;
+            // PclZip's 'folder' flag is 1 for directories.
+            if (!empty($entry['folder'])) continue;
+            if (strpos($name, '__MACOSX') !== false || strpos($name, '.DS_Store') !== false) {
+                continue;
+            }
+            if (strpos($name, '..') !== false || strpos($name, '\\') !== false) {
+                $this->audit_log('self_update', false, $ip, "Path traversal attempt: {$name}");
+                return new WP_Error('forbidden', 'Invalid file path in archive.', ['status' => 403]);
+            }
+            if (basename($name) === 'sadie-publisher.php') {
+                $plugin_entry = $name;
+            } else {
+                $this->audit_log('self_update', false, $ip, "Unexpected file in ZIP: {$name}");
+                return new WP_Error('bad_request', "Unexpected file in archive: " . basename($name), ['status' => 400]);
+            }
+        }
+        if ($plugin_entry === null) {
+            $this->audit_log('self_update', false, $ip, 'ZIP missing sadie-publisher.php');
+            return new WP_Error('bad_request', 'Archive must contain sadie-publisher.php.', ['status' => 400]);
+        }
+        $result = $pclzip->extract(PCLZIP_OPT_BY_NAME, $plugin_entry, PCLZIP_OPT_EXTRACT_AS_STRING);
+        if (!is_array($result) || empty($result[0]['content'])) {
+            $this->audit_log('self_update', false, $ip, 'PclZip extract returned no content for ' . $plugin_entry);
+            return new WP_Error('bad_request', 'Invalid plugin file in archive (PclZip).', ['status' => 400]);
+        }
+        $content = $result[0]['content'];
+        if (strlen($content) < 100) {
+            $this->audit_log('self_update', false, $ip, 'Plugin file too small (' . strlen($content) . ' bytes)');
+            return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
+        }
+        return $content;
+    }
+
     private function validate_and_apply_update($zip_path, $ip, $skip_smoke_test = false) {
         // v3.0.12 — wrap everything in Throwable-catch so silent fatals
         // surface in the audit log. Prior versions let PHP Error/Exception
@@ -1600,55 +1712,15 @@ class Sadie_Publisher {
     }
 
     private function validate_and_apply_update_inner($zip_path, $ip, $skip_smoke_test) {
-        $zip = new ZipArchive();
-        $open_result = $zip->open($zip_path, ZipArchive::RDONLY);
-        if ($open_result !== true) {
-            $this->audit_log('self_update', false, $ip, 'Invalid ZIP archive (open code ' . $open_result . ')');
-            return new WP_Error('bad_request', 'Invalid ZIP archive.', ['status' => 400]);
+        // v3.0.14: extract via ZipArchive (if available) OR PclZip (WP's
+        // pure-PHP fallback — always available). SiteGround's REST-context
+        // PHP doesn't load the php-zip PECL extension, so ZipArchive is
+        // undefined there; PclZip handles that case.
+        $extracted = $this->extract_plugin_php_from_zip($zip_path, $ip);
+        if (is_wp_error($extracted)) {
+            return $extracted;
         }
-        $this->audit_log('self_update', true, $ip, "ZIP opened ({$zip->numFiles} entries)");
-
-        $valid_entries = [];
-        $has_plugin_file = false;
-
-        for ($i = 0; $i < $zip->numFiles; $i++) {
-            $entry = $zip->getNameIndex($i);
-
-            if (substr($entry, -1) === '/' || strpos($entry, '__MACOSX') !== false || strpos($entry, '.DS_Store') !== false) {
-                continue;
-            }
-
-            $basename = basename($entry);
-
-            if (strpos($entry, '..') !== false || strpos($entry, '\\') !== false) {
-                $zip->close();
-                $this->audit_log('self_update', false, $ip, "Path traversal attempt: {$entry}");
-                return new WP_Error('forbidden', 'Invalid file path in archive.', ['status' => 403]);
-            }
-
-            if ($basename === 'sadie-publisher.php') {
-                $has_plugin_file = true;
-                $valid_entries[] = $entry;
-            } else {
-                $zip->close();
-                $this->audit_log('self_update', false, $ip, "Unexpected file in ZIP: {$entry}");
-                return new WP_Error('bad_request', "Unexpected file in archive: {$basename}", ['status' => 400]);
-            }
-        }
-
-        if (!$has_plugin_file) {
-            $zip->close();
-            $this->audit_log('self_update', false, $ip, 'ZIP missing sadie-publisher.php');
-            return new WP_Error('bad_request', 'Archive must contain sadie-publisher.php.', ['status' => 400]);
-        }
-
-        $new_plugin_content = $zip->getFromName($valid_entries[0]);
-        $zip->close();
-
-        if ($new_plugin_content === false || strlen($new_plugin_content) < 100) {
-            $this->audit_log('self_update', false, $ip, 'Could not read plugin file from ZIP or file too small');
-            return new WP_Error('bad_request', 'Invalid plugin file in archive.', ['status' => 400]);
-        }
+        $new_plugin_content = $extracted;
         $this->audit_log('self_update', true, $ip, 'Extracted plugin file (' . strlen($new_plugin_content) . ' bytes)');
 
         if (strpos($new_plugin_content, 'Plugin Name: Sadie') === false) {
