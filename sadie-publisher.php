@@ -3,7 +3,7 @@
  * Plugin Name: Sadie
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.18
+ * Version: 3.0.20
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,26 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.0.20 - Fix: wp_kses_post() was stripping style= attributes from <div>
+ *          elements in brand-color callout components (blog-callout, blog-cards,
+ *          etc.), leaving them unstyled on the live page. Since all content
+ *          arrives via HMAC-SHA256-verified REST calls, kses sanitization is
+ *          redundant and destructive. prepare_content_for_builder() now accepts
+ *          a $trusted flag (default false); both publish + update endpoints pass
+ *          true to skip kses on API-delivered content.
+ * 3.0.19 - resolve_post() no longer blanket-rejects /blog/ as an archive.
+ *          Real editable pages at /blog/ (via Reading → Posts page, or
+ *          a standalone Page) now deploy correctly. New resolution order:
+ *          url_to_postid → page_for_posts → page_on_front → permalink-
+ *          verified slug fallback → archive blocklist. Archive blocklist
+ *          narrowed to true listings only (/category/*, /tag/*, /author/*,
+ *          /page/*, and bare /). Slug fallback's permalink-equality check
+ *          is the real safety rail against wrong-post writes; the blanket
+ *          pattern block was redundant and broke legitimate blog-index pages.
+ * 3.0.18 - Archive URL protection (superseded in 3.0.19). Slug fallback
+ *          now requires permalink equality to prevent wrong-post writes.
+ * 3.0.17 - /headings endpoint — H1 via post_title (+ _sadie_h1_backup),
+ *          H2 regex rewrites in post_content (+ _sadie_h2_backup).
  * 3.0.16 - Schema + image alt deploy endpoints (unblocks the SEO
  *          module's Schema and Image Alt features):
  *          - Added wp_head hook that renders _sadie_schema post meta
@@ -179,7 +199,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.0.18');
+define('SADIE_PUBLISHER_VERSION', '3.0.20');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1283,9 +1303,9 @@ class Sadie_Publisher {
             $post_type = 'post';
         }
 
-        // Prepare post content based on builder
+        // Prepare post content based on builder (trusted=true: content is HMAC-verified, skip kses)
         $builder = $this->detect_builder();
-        $content = $this->prepare_content_for_builder($params['content'], $builder);
+        $content = $this->prepare_content_for_builder($params['content'], $builder, true);
 
         // Build post data
         $post_data = [
@@ -1405,7 +1425,8 @@ class Sadie_Publisher {
         }
         if (!empty($params['content'])) {
             $builder = $this->detect_builder();
-            $post_data['post_content'] = $this->prepare_content_for_builder($params['content'], $builder);
+            // trusted=true: content arrived via HMAC-verified REST API; skip wp_kses_post
+            $post_data['post_content'] = $this->prepare_content_for_builder($params['content'], $builder, true);
         }
         if (!empty($params['status'])) {
             $allowed = ['draft', 'publish', 'pending', 'future', 'private'];
@@ -2029,9 +2050,15 @@ class Sadie_Publisher {
     // CONTENT PREPARATION (Builder-Aware)
     // =========================================================================
 
-    private function prepare_content_for_builder($content, $builder) {
-        // Sanitize HTML content
-        $content = wp_kses_post($content);
+    private function prepare_content_for_builder($content, $builder, $trusted = false) {
+        // wp_kses_post strips style= attributes from <div> elements, which breaks
+        // Sadie's brand-color callout components (blog-callout, blog-cards, etc.).
+        // All content arriving via the Sadie Publisher REST API is already authenticated
+        // via HMAC-SHA256, so kses sanitization is redundant and destructive here.
+        // We skip it for trusted API calls; still run it for any future untrusted paths.
+        if (!$trusted) {
+            $content = wp_kses_post($content);
+        }
 
         switch ($builder['name']) {
             case 'gutenberg':
@@ -2692,17 +2719,19 @@ class Sadie_Publisher {
             return $posts[0];
         }
 
-        // By URL — extract the path and use url_to_postid.
+        // By URL — resolve to an editable WP_Post via this order:
+        //   1. url_to_postid() — standalone pages/posts/products
+        //   2. page_for_posts — WP "Posts page" (Reading settings), e.g. /blog/
+        //      as a real editable Page whose permalink WP routes as the blog index
+        //   3. page_on_front — static front page (Reading settings)
+        //   4. Slug fallback — but only when the candidate's permalink equals
+        //      the submitted URL (prevents writing to a random same-slug post)
+        //   5. Archive blocklist — only for true taxonomy/author/pagination URLs
         //
-        // v3.0.18: reject archive URLs up front (/blog/, /category/*, /tag/*,
-        // /author/*, /?s=) — url_to_postid returns 0 for archives and the
-        // old slug-fallback would accidentally match a random post of the
-        // same slug (e.g. any post named "blog"), quietly writing the
-        // archive's "proposal" into the wrong post.
-        //
-        // For the slug-fallback to fire, the resolved post's permalink must
-        // actually match the submitted URL. Otherwise we 404 rather than
-        // silently scribble on the wrong record.
+        // v3.0.19: removed blanket /blog/ rejection. /blog/ is commonly a real
+        // editable Page (posts page); handled via page_for_posts above. Slug
+        // fallback's permalink check is enough to prevent wrong-post writes
+        // when there's no backing page.
         if (!empty($params['url'])) {
             $url = esc_url_raw($params['url']);
             $post_id = url_to_postid($url);
@@ -2710,23 +2739,27 @@ class Sadie_Publisher {
                 return get_post($post_id);
             }
 
-            $path = trim(wp_parse_url($url, PHP_URL_PATH), '/');
-            // Archive-style URLs never resolve to a single editable post.
-            $archive_prefixes = ['blog', 'category', 'tag', 'author', 'page'];
-            $first_segment = explode('/', $path)[0] ?? '';
-            $is_archive = $path === '' || in_array($first_segment, $archive_prefixes, true);
-            if ($is_archive) {
-                return new WP_Error(
-                    'archive_url',
-                    "URL '{$url}' is an archive/listing page with no editable post_id. Update the theme/Yoast archive settings directly.",
-                    ['status' => 400]
-                );
+            $normalized_url = rtrim($url, '/');
+
+            $posts_page_id = (int) get_option('page_for_posts');
+            if ($posts_page_id) {
+                $posts_page_url = get_permalink($posts_page_id);
+                if ($posts_page_url && rtrim($posts_page_url, '/') === $normalized_url) {
+                    return get_post($posts_page_id);
+                }
             }
 
-            // Slug fallback — but only when the candidate's own permalink
-            // matches the submitted URL. Prevents false matches.
-            $segments = explode('/', $path);
-            $slug = end($segments);
+            $front_page_id = (int) get_option('page_on_front');
+            if ($front_page_id && (string) get_option('show_on_front') === 'page') {
+                $front_page_url = get_permalink($front_page_id);
+                if ($front_page_url && rtrim($front_page_url, '/') === $normalized_url) {
+                    return get_post($front_page_id);
+                }
+            }
+
+            $path = trim(wp_parse_url($url, PHP_URL_PATH), '/');
+            $segments = $path === '' ? [] : explode('/', $path);
+            $slug = !empty($segments) ? end($segments) : '';
             if ($slug) {
                 $posts = get_posts([
                     'name' => sanitize_title($slug),
@@ -2736,11 +2769,24 @@ class Sadie_Publisher {
                 ]);
                 foreach ($posts as $candidate) {
                     $cand_url = get_permalink($candidate->ID);
-                    if ($cand_url && rtrim($cand_url, '/') === rtrim($url, '/')) {
+                    if ($cand_url && rtrim($cand_url, '/') === $normalized_url) {
                         return $candidate;
                     }
                 }
             }
+
+            // True archives: taxonomy/author listings + paginated listings + home.
+            $archive_prefixes = ['category', 'tag', 'author', 'page'];
+            $first_segment = $segments[0] ?? '';
+            $is_archive = $path === '' || in_array($first_segment, $archive_prefixes, true);
+            if ($is_archive) {
+                return new WP_Error(
+                    'archive_url',
+                    "URL '{$url}' is an archive/listing page with no editable post_id. Update the theme/Yoast archive settings directly.",
+                    ['status' => 400]
+                );
+            }
+
             return new WP_Error('not_found', "No post found for URL '{$url}'.", ['status' => 404]);
         }
 
