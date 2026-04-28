@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: Sadie
+ * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
  * Version: 3.0.20
