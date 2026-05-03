@@ -11,14 +11,16 @@
  * Requires at least: 5.8
  *
  * Changelog:
- * 3.0.21 - New: Sadie_References_Widget injects a visible "References on this
- *          page" aside on every blog post listing the internal links present
- *          in the body. Right-floats on desktop, stacks on mobile. Reads from
- *          the rendered DOM after Sadie_Internal_Links runs (priority 30).
- *          New settings: references_widget_enabled (default true),
- *          references_widget_position (top|bottom|float — default float).
- *          REST endpoint /sadie/v1/references-extract lets BCC pull the same
- *          list from a post's stored content for editor preview.
+ * 3.0.21 - New: "References on this page" aside baked into post_content at
+ *          publish time. Lists every internal link already in the body as a
+ *          visible sidebar block (right-floats on desktop, stacks on mobile).
+ *          Generated inside prepare_content_for_builder() during publish/update,
+ *          so the rendered HTML is part of the saved post — no runtime hook,
+ *          no plugin upgrade dependency on client sites. BCC's editor preview
+ *          panel does the same regex extraction client-side so what writers
+ *          see while drafting matches what gets baked.
+ *          New settings: references_widget_enabled (default on),
+ *          references_widget_position (float|top|bottom — default float).
  * 3.0.20 - Fix: wp_kses_post() was stripping style= attributes from <div>
  *          elements in brand-color callout components (blog-callout, blog-cards,
  *          etc.), leaving them unstyled on the live page. Since all content
@@ -2074,6 +2076,12 @@ class Sadie_Publisher {
             $content = wp_kses_post($content);
         }
 
+        // v3.0.21 — bake the "References on this page" aside into post_content at
+        // publish time. Links are written into the body at blog creation; the
+        // aside is just a derived list of those links rendered as static HTML so
+        // every WP version + builder shows it, no plugin runtime required.
+        $content = $this->bake_references_aside($content);
+
         switch ($builder['name']) {
             case 'gutenberg':
                 return $this->convert_to_gutenberg_blocks($content);
@@ -2098,6 +2106,58 @@ class Sadie_Publisher {
                 // Classic editor / other builders: standard HTML
                 return $content;
         }
+    }
+
+    /**
+     * Generate "References on this page" aside from internal links already in
+     * the body and bake it into the content. Replaces any prior baked block so
+     * republishes stay current with the link set.
+     */
+    private function bake_references_aside($content) {
+        $settings = get_option('sadie_publisher_settings', []);
+        if (isset($settings['references_widget_enabled']) && empty($settings['references_widget_enabled'])) {
+            // explicitly disabled — strip any prior block and return
+            return preg_replace('#<aside class="sadie-references[^"]*"[^>]*>.*?</aside>#is', '', $content) ?? $content;
+        }
+        // Strip any existing baked aside first so we always re-render fresh
+        $content = preg_replace('#<aside class="sadie-references[^"]*"[^>]*>.*?</aside>#is', '', $content) ?? $content;
+
+        $home_host = parse_url(home_url(), PHP_URL_HOST);
+        $refs = Sadie_References_Widget::extract_references($content, $home_host);
+        if (count($refs) < 2) return $content;
+
+        $position = $settings['references_widget_position'] ?? 'float';
+        if (!in_array($position, ['float','top','bottom'], true)) $position = 'float';
+
+        $title = ($position === 'bottom') ? 'Also mentioned in this post' : 'References on this page';
+        $items = '';
+        foreach ($refs as $r) {
+            $items .= sprintf(
+                '<li><a href="%s">%s</a></li>',
+                esc_url($r['href']),
+                esc_html($r['anchor'])
+            );
+        }
+        // Inline styles so the aside renders correctly even on themes that
+        // don't load the wp_head <style> block (older themes, AMP, RSS readers).
+        $style_aside = 'margin:1.25em 0;padding:1em 1.25em;border:1px solid #e2e8f0;border-radius:.5rem;background:#f8fafc;font-size:.95em;line-height:1.55;'
+                     . ($position === 'float' ? 'float:right;clear:right;width:280px;margin-left:1.5em;' : '');
+        $widget = sprintf(
+            '<aside class="sadie-references sadie-references--%s" style="%s"><div class="sadie-references__title" style="font-weight:600;font-size:.85em;letter-spacing:.04em;text-transform:uppercase;color:#475569;margin-bottom:.5em;">%s</div><ul class="sadie-references__list" style="margin:0;padding-left:1.1em;list-style:disc;">%s</ul></aside>',
+            esc_attr($position),
+            esc_attr($style_aside),
+            esc_html($title),
+            $items
+        );
+
+        if ($position === 'top')    return $widget . $content;
+        if ($position === 'bottom') return $content . $widget;
+        // float: insert after first paragraph close
+        $parts = preg_split('#(</p>)#i', $content, 2, PREG_SPLIT_DELIM_CAPTURE);
+        if (count($parts) >= 3) {
+            return $parts[0] . $parts[1] . $widget . implode('', array_slice($parts, 2));
+        }
+        return $widget . $content;
     }
 
     private function convert_to_gutenberg_blocks($html) {
@@ -3290,45 +3350,19 @@ class Sadie_Health_Monitor {
 // =============================================================================
 
 /**
- * Renders a visible "References on this page" aside on every blog post,
- * listing the internal links the post body actually contains. Reader-facing
- * UX + clean internal-link signal for Google. Hooks `the_content` at priority
- * 30 so it runs AFTER Sadie_Internal_Links (priority 20) — that way any links
- * injected by the link engine also show up in the references list.
+ * Static helper for extracting internal links from a post body.
  *
- * Position modes:
- *   - float  (default): right-floated aside inside post content; clears on mobile
- *   - top:              full-width callout at the start of the post
- *   - bottom:           full-width "Mentioned in this post" block at the end
- *
- * Same extraction logic is exposed at /sadie-publisher/v1/references-extract
- * so BCC's editor can show the live list while a draft is being written.
+ * The references aside is BAKED into post_content at publish time inside
+ * prepare_content_for_builder() — so the rendered HTML is part of the saved
+ * post, no runtime hook required. That means sites on older publisher
+ * versions still display the widget on their next publish, with no plugin
+ * upgrade dependency. Editor preview in BCC uses the same regex extraction
+ * client-side so what the editor sees matches what gets baked.
  */
 class Sadie_References_Widget {
-    public function __construct() {
-        add_filter('the_content', [$this, 'inject'], 30);
-        add_action('wp_head', [$this, 'css'], 5);
-    }
-
-    private function settings() {
-        return get_option('sadie_publisher_settings', []);
-    }
-
-    private function enabled() {
-        $s = $this->settings();
-        // Default ON (sites can opt out via settings)
-        return !isset($s['references_widget_enabled']) || !empty($s['references_widget_enabled']);
-    }
-
-    private function position() {
-        $s = $this->settings();
-        $pos = $s['references_widget_position'] ?? 'float';
-        return in_array($pos, ['float','top','bottom'], true) ? $pos : 'float';
-    }
-
     /**
      * Extract internal anchors from rendered HTML. Returns deduped list of
-     * [{ 'anchor' => 'visible text', 'href' => 'https://site.com/...', 'title' => 'pulled by sadie or null' }].
+     * [{ 'anchor' => 'visible text', 'href' => 'https://site.com/...', 'title' => null }].
      * Skips assets, fragment-only, and links inside nav/aside/figure.
      */
     public static function extract_references($html, $home_host = null) {
@@ -3368,61 +3402,6 @@ class Sadie_References_Widget {
             }
         }
         return array_values($refs);
-    }
-
-    public function inject($content) {
-        if (!$this->enabled()) return $content;
-        if (is_admin() || is_feed() || is_404()) return $content;
-        if (!is_singular('post')) return $content;
-        if (!in_the_loop() || !is_main_query()) return $content;
-
-        $refs = self::extract_references($content);
-        if (count($refs) < 2) return $content; // not worth showing for 0-1 links
-
-        $items = '';
-        foreach ($refs as $r) {
-            $items .= sprintf(
-                '<li><a href="%s">%s</a></li>',
-                esc_url($r['href']),
-                esc_html($r['anchor'])
-            );
-        }
-
-        $count = count($refs);
-        $position = $this->position();
-
-        $title  = ($position === 'bottom') ? 'Also mentioned in this post' : 'References on this page';
-        $widget = sprintf(
-            '<aside class="sadie-references sadie-references--%s" aria-label="%s"><div class="sadie-references__title">%s</div><ul class="sadie-references__list">%s</ul></aside>',
-            esc_attr($position),
-            esc_attr($title),
-            esc_html($title),
-            $items
-        );
-
-        if ($position === 'top')    return $widget . $content;
-        if ($position === 'bottom') return $content . $widget;
-        // float: insert after the first paragraph so it floats alongside body copy
-        $parts = preg_split('#(</p>)#i', $content, 2, PREG_SPLIT_DELIM_CAPTURE);
-        if (count($parts) >= 3) {
-            return $parts[0] . $parts[1] . $widget . implode('', array_slice($parts, 2));
-        }
-        return $widget . $content;
-    }
-
-    public function css() {
-        if (!is_singular('post')) return;
-        if (!$this->enabled()) return;
-        echo '<style id="sadie-references-css">
-.sadie-references{margin:1.25em 0;padding:1em 1.25em;border:1px solid #e2e8f0;border-radius:.5rem;background:#f8fafc;font-size:.95em;line-height:1.55;}
-.sadie-references__title{font-weight:600;font-size:.85em;letter-spacing:.04em;text-transform:uppercase;color:#475569;margin-bottom:.5em;}
-.sadie-references__list{margin:0;padding-left:1.1em;list-style:disc;}
-.sadie-references__list li{margin:.25em 0;}
-.sadie-references__list a{text-decoration:underline;text-underline-offset:2px;}
-.sadie-references--float{float:right;clear:right;width:280px;margin-left:1.5em;margin-top:.25em;}
-@media (max-width:768px){.sadie-references--float{float:none;width:auto;margin-left:0;}}
-.sadie-references--top,.sadie-references--bottom{display:block;width:100%;}
-</style>';
     }
 }
 
@@ -3476,24 +3455,9 @@ add_action('rest_api_init', function() {
 add_action('init', function() {
     new Sadie_Internal_Links();
     new Sadie_Health_Monitor();
-    new Sadie_References_Widget();
+    // Sadie_References_Widget is a static helper (extract_references); no instance needed.
+    // The aside is baked into post_content at publish time inside prepare_content_for_builder().
 }, 20);
-
-// References-extract REST: BCC editor calls this to preview the widget contents
-// for an in-flight draft (before publish). Auth: same HMAC pattern as other routes.
-add_action('rest_api_init', function() {
-    register_rest_route('sadie-publisher/v1', '/references-extract', [
-        'methods'  => 'POST',
-        'permission_callback' => [Sadie_Publisher::get_instance(), 'verify_request'],
-        'callback' => function($req) {
-            $body = $req->get_json_params();
-            $html = (string) ($body['html'] ?? '');
-            if (!$html) return new WP_REST_Response(['references' => []], 200);
-            $refs = Sadie_References_Widget::extract_references($html, parse_url(home_url(), PHP_URL_HOST));
-            return new WP_REST_Response(['references' => $refs, 'count' => count($refs)], 200);
-        },
-    ]);
-});
 
 // =============================================================================
 // INITIALIZATION
