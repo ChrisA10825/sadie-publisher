@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.0.21
+ * Version: 3.0.20
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,14 +11,6 @@
  * Requires at least: 5.8
  *
  * Changelog:
- * 3.0.21 - New: Sadie_References_Widget injects a visible "References on this
- *          page" aside on every blog post listing the internal links present
- *          in the body. Right-floats on desktop, stacks on mobile. Reads from
- *          the rendered DOM after Sadie_Internal_Links runs (priority 30).
- *          New settings: references_widget_enabled (default true),
- *          references_widget_position (top|bottom|float — default float).
- *          REST endpoint /sadie/v1/references-extract lets BCC pull the same
- *          list from a post's stored content for editor preview.
  * 3.0.20 - Fix: wp_kses_post() was stripping style= attributes from <div>
  *          elements in brand-color callout components (blog-callout, blog-cards,
  *          etc.), leaving them unstyled on the live page. Since all content
@@ -342,12 +334,6 @@ class Sadie_Publisher {
         $clean['sadie_api_base'] = !empty($input['sadie_api_base'])
             ? esc_url_raw($input['sadie_api_base'])
             : SADIE_API_BASE;
-        // v3.0.21 — references widget (default ON)
-        $clean['references_widget_enabled'] = isset($input['references_widget_enabled'])
-            ? (!empty($input['references_widget_enabled']) ? 1 : 0)
-            : 1;
-        $pos = $input['references_widget_position'] ?? 'float';
-        $clean['references_widget_position'] = in_array($pos, ['float','top','bottom'], true) ? $pos : 'float';
         return $clean;
     }
 
@@ -3286,147 +3272,6 @@ class Sadie_Health_Monitor {
 }
 
 // =============================================================================
-// v3.0.21 — References Sidebar Widget
-// =============================================================================
-
-/**
- * Renders a visible "References on this page" aside on every blog post,
- * listing the internal links the post body actually contains. Reader-facing
- * UX + clean internal-link signal for Google. Hooks `the_content` at priority
- * 30 so it runs AFTER Sadie_Internal_Links (priority 20) — that way any links
- * injected by the link engine also show up in the references list.
- *
- * Position modes:
- *   - float  (default): right-floated aside inside post content; clears on mobile
- *   - top:              full-width callout at the start of the post
- *   - bottom:           full-width "Mentioned in this post" block at the end
- *
- * Same extraction logic is exposed at /sadie-publisher/v1/references-extract
- * so BCC's editor can show the live list while a draft is being written.
- */
-class Sadie_References_Widget {
-    public function __construct() {
-        add_filter('the_content', [$this, 'inject'], 30);
-        add_action('wp_head', [$this, 'css'], 5);
-    }
-
-    private function settings() {
-        return get_option('sadie_publisher_settings', []);
-    }
-
-    private function enabled() {
-        $s = $this->settings();
-        // Default ON (sites can opt out via settings)
-        return !isset($s['references_widget_enabled']) || !empty($s['references_widget_enabled']);
-    }
-
-    private function position() {
-        $s = $this->settings();
-        $pos = $s['references_widget_position'] ?? 'float';
-        return in_array($pos, ['float','top','bottom'], true) ? $pos : 'float';
-    }
-
-    /**
-     * Extract internal anchors from rendered HTML. Returns deduped list of
-     * [{ 'anchor' => 'visible text', 'href' => 'https://site.com/...', 'title' => 'pulled by sadie or null' }].
-     * Skips assets, fragment-only, and links inside nav/aside/figure.
-     */
-    public static function extract_references($html, $home_host = null) {
-        if (!$html) return [];
-        if (!$home_host) {
-            $home_host = parse_url(home_url(), PHP_URL_HOST);
-        }
-        // Strip elements that wouldn't count as body references
-        $stripped = preg_replace(
-            '#<(nav|aside|figure|figcaption|script|style|noscript|footer|header)\b[^>]*>.*?</\1>#is',
-            '',
-            $html
-        );
-        if (!$stripped) $stripped = $html;
-
-        $refs = [];
-        if (preg_match_all('#<a\s+[^>]*href=([\'"])([^\'"]+)\1[^>]*>(.*?)</a>#is', $stripped, $m, PREG_SET_ORDER)) {
-            foreach ($m as $row) {
-                $href = trim($row[2]);
-                $anchor = trim(strip_tags($row[3]));
-                if ($href === '' || $anchor === '') continue;
-                if (strpos($href, '#') === 0) continue;
-                if (preg_match('#\.(jpg|jpeg|png|gif|webp|svg|pdf|zip|mp4|mp3|css|js)(\?|$)#i', $href)) continue;
-
-                // Only internal links (same host or relative)
-                $host = parse_url($href, PHP_URL_HOST);
-                if ($host && $home_host && stripos($host, $home_host) === false) continue;
-
-                // Normalize for dedupe
-                $key = strtolower(rtrim(preg_replace('#\?.*$#','',$href), '/'));
-                if (isset($refs[$key])) continue;
-                $refs[$key] = [
-                    'anchor' => $anchor,
-                    'href'   => $href,
-                    'title'  => null, // post title resolution is too expensive in render path
-                ];
-            }
-        }
-        return array_values($refs);
-    }
-
-    public function inject($content) {
-        if (!$this->enabled()) return $content;
-        if (is_admin() || is_feed() || is_404()) return $content;
-        if (!is_singular('post')) return $content;
-        if (!in_the_loop() || !is_main_query()) return $content;
-
-        $refs = self::extract_references($content);
-        if (count($refs) < 2) return $content; // not worth showing for 0-1 links
-
-        $items = '';
-        foreach ($refs as $r) {
-            $items .= sprintf(
-                '<li><a href="%s">%s</a></li>',
-                esc_url($r['href']),
-                esc_html($r['anchor'])
-            );
-        }
-
-        $count = count($refs);
-        $position = $this->position();
-
-        $title  = ($position === 'bottom') ? 'Also mentioned in this post' : 'References on this page';
-        $widget = sprintf(
-            '<aside class="sadie-references sadie-references--%s" aria-label="%s"><div class="sadie-references__title">%s</div><ul class="sadie-references__list">%s</ul></aside>',
-            esc_attr($position),
-            esc_attr($title),
-            esc_html($title),
-            $items
-        );
-
-        if ($position === 'top')    return $widget . $content;
-        if ($position === 'bottom') return $content . $widget;
-        // float: insert after the first paragraph so it floats alongside body copy
-        $parts = preg_split('#(</p>)#i', $content, 2, PREG_SPLIT_DELIM_CAPTURE);
-        if (count($parts) >= 3) {
-            return $parts[0] . $parts[1] . $widget . implode('', array_slice($parts, 2));
-        }
-        return $widget . $content;
-    }
-
-    public function css() {
-        if (!is_singular('post')) return;
-        if (!$this->enabled()) return;
-        echo '<style id="sadie-references-css">
-.sadie-references{margin:1.25em 0;padding:1em 1.25em;border:1px solid #e2e8f0;border-radius:.5rem;background:#f8fafc;font-size:.95em;line-height:1.55;}
-.sadie-references__title{font-weight:600;font-size:.85em;letter-spacing:.04em;text-transform:uppercase;color:#475569;margin-bottom:.5em;}
-.sadie-references__list{margin:0;padding-left:1.1em;list-style:disc;}
-.sadie-references__list li{margin:.25em 0;}
-.sadie-references__list a{text-decoration:underline;text-underline-offset:2px;}
-.sadie-references--float{float:right;clear:right;width:280px;margin-left:1.5em;margin-top:.25em;}
-@media (max-width:768px){.sadie-references--float{float:none;width:auto;margin-left:0;}}
-.sadie-references--top,.sadie-references--bottom{display:block;width:100%;}
-</style>';
-    }
-}
-
-// =============================================================================
 // v3.0 — Links refresh + Page-state probe REST routes
 // =============================================================================
 
@@ -3476,24 +3321,7 @@ add_action('rest_api_init', function() {
 add_action('init', function() {
     new Sadie_Internal_Links();
     new Sadie_Health_Monitor();
-    new Sadie_References_Widget();
 }, 20);
-
-// References-extract REST: BCC editor calls this to preview the widget contents
-// for an in-flight draft (before publish). Auth: same HMAC pattern as other routes.
-add_action('rest_api_init', function() {
-    register_rest_route('sadie-publisher/v1', '/references-extract', [
-        'methods'  => 'POST',
-        'permission_callback' => [Sadie_Publisher::get_instance(), 'verify_request'],
-        'callback' => function($req) {
-            $body = $req->get_json_params();
-            $html = (string) ($body['html'] ?? '');
-            if (!$html) return new WP_REST_Response(['references' => []], 200);
-            $refs = Sadie_References_Widget::extract_references($html, parse_url(home_url(), PHP_URL_HOST));
-            return new WP_REST_Response(['references' => $refs, 'count' => count($refs)], 200);
-        },
-    ]);
-});
 
 // =============================================================================
 // INITIALIZATION
