@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.6
+ * Version: 3.2.7
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,8 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.2.7 - Same code as 3.2.6 with SADIE_PUBLISHER_VERSION bumped to match the
+ *         header (3.2.6 shipped with the constant still at 3.2.5, so /ping misreported).
  * 3.2.6 - /publish and /publish/{id} accept optional `parent` (page id, 0 clears)
  *         and `template` (page template file, 'default' clears). Pages only;
  *         the parent must be an existing page that is not the post itself, the
@@ -312,7 +314,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.2.5');
+define('SADIE_PUBLISHER_VERSION', '3.2.7');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
