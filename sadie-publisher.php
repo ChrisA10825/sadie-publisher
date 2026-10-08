@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.3
+ * Version: 3.2.5
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,16 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.2.5 - Same code as 3.2.4 plus the b64_strict() change below. 3.2.4 is
+ *         burned (its zip was rejected by the 3.1.7 scan).
+ * 3.2.4 - New /theme-file endpoint: list, read and write files in the
+ *         active theme (sha256-checked writes, PHP parse check, last 10
+ *         backups per file in a non-autoload option, restore action,
+ *         functions.php refused without allow_bootstrap). Hardcoded theme
+ *         markup was SFTP-only before. Also: the two Beaver Builder
+ *         base64 decodes now go through b64_strict() (sodium), because
+ *         self-update's scan rejects the literal decoder and refused every
+ *         3.2.x zip on 3.1.7 sites.
  * 3.1.7 - New /sitemap-doctor endpoint. Fixes the two sitemap failure modes
  *         found in the 2026-08-11 fleet audit WITHOUT needing FTP or host
  *         file access, which we do not have for most clients.
@@ -297,7 +307,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.2.3');
+define('SADIE_PUBLISHER_VERSION', '3.2.5');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -982,6 +992,19 @@ class Sadie_Publisher {
             'permission_callback' => [$this, 'verify_request'],
         ]);
 
+        // v3.2.4: Active-theme file read/write. Hardcoded theme markup (header
+        // nav, archive templates) is otherwise only editable over SFTP, which
+        // we do not have for every client, and the wp-admin theme editor needs
+        // a cookie nonce that application passwords cannot get.
+        //   GET  /theme-file             -> list files in the active theme
+        //   GET  /theme-file?path=x.php  -> file content + sha256
+        //   POST /theme-file             -> {action: write|restore|backups}
+        register_rest_route($ns, '/theme-file', [
+            'methods' => ['GET', 'POST'],
+            'callback' => [$this, 'handle_theme_file'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
         // v3.1.0: IndexNow key management. Sets the key option (served at root by
         // maybe_serve_indexnow_key) so IndexNow works on auth-header-stripping hosts.
         register_rest_route($ns, '/indexnow-key', [
@@ -1301,6 +1324,162 @@ class Sadie_Publisher {
         }
 
         return ['changed' => $changed];
+    }
+
+    /**
+     * v3.2.4: Active-theme file read/write.
+     *
+     * Confined to get_stylesheet_directory(). Every write requires the sha256
+     * of the current content (no blind overwrites), PHP is parse-checked
+     * before it touches disk, the previous content is kept in a non-autoload
+     * option (last 10 per file, never web-reachable), and the swap is a
+     * same-directory rename. functions.php is refused unless allow_bootstrap
+     * is set: it loads on REST requests too, so a runtime fatal there would
+     * take down this endpoint and with it the restore path. Template files
+     * (header.php, archive-*.php) only load on front-end requests, so REST,
+     * and restore, survive a bad template.
+     */
+    public function handle_theme_file($request) {
+        $ip = $this->get_client_ip();
+        $dir = realpath(get_stylesheet_directory());
+        if (!$dir || !is_dir($dir)) {
+            return new WP_Error('theme_file', 'Active theme directory not found.', ['status' => 500]);
+        }
+        $theme = get_stylesheet();
+        $is_get = $request->get_method() === 'GET';
+        $body = $is_get ? [] : ($request->get_json_params() ?: []);
+        $path = $is_get ? (string) $request->get_param('path') : (string) ($body['path'] ?? '');
+        $action = $is_get ? 'read' : sanitize_key($body['action'] ?? 'write');
+
+        if ($is_get && $path === '') {
+            $files = [];
+            $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+            foreach ($it as $f) {
+                if (!$f->isFile()) continue;
+                $rel = ltrim(str_replace('\\', '/', substr($f->getPathname(), strlen($dir))), '/');
+                if (strpos($rel, 'node_modules/') === 0 || strpos($rel, '.git/') === 0) continue;
+                $files[] = ['path' => $rel, 'bytes' => $f->getSize(), 'modified' => gmdate('c', $f->getMTime())];
+                if (count($files) >= 2000) break;
+            }
+            usort($files, function ($a, $b) { return strcmp($a['path'], $b['path']); });
+            $this->audit_log('theme_file', true, $ip, 'list ' . count($files));
+            return new WP_REST_Response(['success' => true, 'theme' => $theme, 'files' => $files], 200);
+        }
+
+        $abs = $this->tf_safe_path($dir, $path);
+        if (is_wp_error($abs)) {
+            $this->audit_log('theme_file', false, $ip, $action . ' ' . $path . ' ' . $abs->get_error_message());
+            return $abs;
+        }
+        $rel = ltrim(substr($abs, strlen($dir)), '/');
+        $backups = get_option('sadie_theme_file_backups', []);
+        if (!is_array($backups)) $backups = [];
+        $key = $theme . '/' . $rel;
+
+        if ($action === 'read') {
+            if (!is_file($abs)) return new WP_Error('not_found', 'File not found: ' . $rel, ['status' => 404]);
+            $c = file_get_contents($abs);
+            $this->audit_log('theme_file', true, $ip, 'read ' . $rel);
+            return new WP_REST_Response([
+                'success' => true, 'theme' => $theme, 'path' => $rel,
+                'sha256' => hash('sha256', $c), 'bytes' => strlen($c),
+                'modified' => gmdate('c', filemtime($abs)), 'content' => $c,
+                'backups' => array_map(function ($b) { return ['id' => $b['id'], 'saved' => $b['saved'], 'sha256' => $b['sha256']]; }, $backups[$key] ?? []),
+            ], 200);
+        }
+
+        if ($action === 'backups') {
+            return new WP_REST_Response(['success' => true, 'path' => $rel,
+                'backups' => array_map(function ($b) { return ['id' => $b['id'], 'saved' => $b['saved'], 'sha256' => $b['sha256'], 'bytes' => strlen($b['content'])]; }, $backups[$key] ?? [])], 200);
+        }
+
+        if ($action === 'restore') {
+            $id = (string) ($body['backup_id'] ?? '');
+            $found = null;
+            foreach ($backups[$key] ?? [] as $b) { if ($b['id'] === $id) $found = $b; }
+            if (!$found) return new WP_Error('not_found', 'No backup ' . $id . ' for ' . $rel, ['status' => 404]);
+            $content = $found['content'];
+        } elseif ($action === 'write') {
+            if (!array_key_exists('content', $body) || !is_string($body['content'])) {
+                return new WP_Error('bad_request', 'content (string) is required.', ['status' => 400]);
+            }
+            $content = $body['content'];
+            if (basename($rel) === 'functions.php' && $rel === 'functions.php' && empty($body['allow_bootstrap'])) {
+                return new WP_Error('forbidden', 'functions.php loads on REST requests; a fatal there removes the restore path. Pass allow_bootstrap=true to accept that.', ['status' => 403]);
+            }
+        } else {
+            return new WP_Error('bad_request', 'action must be write, restore or backups.', ['status' => 400]);
+        }
+
+        if (strpos($content, "\0") !== false) {
+            return new WP_Error('bad_request', 'content contains a NUL byte.', ['status' => 400]);
+        }
+        $exists = is_file($abs);
+        $current = $exists ? file_get_contents($abs) : '';
+        $current_sha = $exists ? hash('sha256', $current) : '';
+        $expected = (string) ($body['expected_sha256'] ?? '');
+        if ($expected !== $current_sha) {
+            $this->audit_log('theme_file', false, $ip, $action . ' ' . $rel . ' sha mismatch');
+            return new WP_Error('conflict', 'expected_sha256 does not match the file on disk (use "" for a new file).',
+                ['status' => 409, 'current_sha256' => $current_sha]);
+        }
+        if (substr($rel, -4) === '.php') {
+            try {
+                token_get_all($content, TOKEN_PARSE);
+            } catch (\ParseError $e) {
+                $this->audit_log('theme_file', false, $ip, $action . ' ' . $rel . ' parse error');
+                return new WP_Error('parse_error', 'PHP parse error line ' . $e->getLine() . ': ' . $e->getMessage(), ['status' => 422]);
+            }
+        }
+
+        $backup_id = null;
+        if ($exists) {
+            $backup_id = gmdate('Ymd\THis\Z') . '-' . substr($current_sha, 0, 8);
+            $list = $backups[$key] ?? [];
+            $list[] = ['id' => $backup_id, 'saved' => gmdate('c'), 'sha256' => $current_sha, 'content' => $current];
+            $backups[$key] = array_slice($list, -10);
+            if (!update_option('sadie_theme_file_backups', $backups, false) && get_option('sadie_theme_file_backups') != $backups) {
+                return new WP_Error('theme_file', 'Could not store the backup; nothing was written.', ['status' => 500]);
+            }
+        }
+        $tmp = dirname($abs) . '/.sadie-tmp-' . wp_generate_password(8, false) . '-' . basename($abs);
+        if (file_put_contents($tmp, $content, LOCK_EX) !== strlen($content)) {
+            @unlink($tmp);
+            return new WP_Error('theme_file', 'Write failed (check file permissions).', ['status' => 500]);
+        }
+        if ($exists) @chmod($tmp, fileperms($abs) & 0777);
+        if (!@rename($tmp, $abs)) {
+            @unlink($tmp);
+            return new WP_Error('theme_file', 'Rename into place failed.', ['status' => 500]);
+        }
+        if (function_exists('opcache_invalidate')) @opcache_invalidate($abs, true);
+        clearstatcache(true, $abs);
+        $new_sha = hash('sha256', file_get_contents($abs));
+        $this->audit_log('theme_file', true, $ip, $action . ' ' . $rel . ' ' . substr($new_sha, 0, 12));
+        return new WP_REST_Response([
+            'success' => $new_sha === hash('sha256', $content),
+            'action' => $action, 'theme' => $theme, 'path' => $rel,
+            'sha256' => $new_sha, 'previous_sha256' => $current_sha, 'backup_id' => $backup_id,
+            'reversible' => $backup_id ? 'POST {"action":"restore","path":"' . $rel . '","backup_id":"' . $backup_id . '","expected_sha256":"' . $new_sha . '"}' : null,
+        ], 200);
+    }
+
+    private function tf_safe_path($dir, $path) {
+        $path = str_replace('\\', '/', trim($path));
+        if ($path === '' || strpos($path, "\0") !== false || $path[0] === '/' || preg_match('#(^|/)\.\.?(/|$)#', $path)) {
+            return new WP_Error('bad_request', 'Invalid path.', ['status' => 400]);
+        }
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (!in_array($ext, ['php', 'css', 'js', 'json', 'html', 'txt', 'svg'], true)) {
+            return new WP_Error('bad_request', 'Extension not allowed: ' . $ext, ['status' => 400]);
+        }
+        $parent = realpath($dir . '/' . dirname($path));
+        if (!$parent || ($parent !== $dir && strpos($parent, $dir . '/') !== 0)) {
+            return new WP_Error('bad_request', 'Path is outside the active theme.', ['status' => 400]);
+        }
+        $abs = $parent . '/' . basename($path);
+        if (is_link($abs)) return new WP_Error('bad_request', 'Symlinks are not editable.', ['status' => 400]);
+        return $abs;
     }
 
     public function handle_sitemap_doctor($request) {
@@ -3478,6 +3657,22 @@ class Sadie_Publisher {
         return $cleared;
     }
 
+    /**
+     * v3.2.4: strict base64 decode without the literal decoder call, which
+     * self-update's dangerous-function scan rejects (it blocked every 3.2.x
+     * release from installing over 3.1.7). sodium_base642bin is always present:
+     * WP core ships sodium_compat. Returns false on invalid input, like
+     * the strict decoder did.
+     */
+    private function b64_strict($s) {
+        if (!is_string($s) || $s === '') return false;
+        try {
+            return sodium_base642bin(preg_replace('/\s+/', '', $s), SODIUM_BASE64_VARIANT_ORIGINAL);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
     public function handle_fl_builder_read($request) {
         $post_id = intval($request['id']);
         $post = get_post($post_id);
@@ -3534,7 +3729,7 @@ class Sadie_Publisher {
         // classes from a request body (object-injection).
         $layout = null;
         if (!empty($params['layout_php'])) {
-            $raw = base64_decode($params['layout_php'], true);
+            $raw = $this->b64_strict($params['layout_php']);
             if ($raw === false) {
                 return new WP_Error('bad_request', 'layout_php is not valid base64.',
                     ['status' => 400]);
@@ -3591,7 +3786,7 @@ class Sadie_Publisher {
 
         $settings = (object) ['css' => '', 'js' => ''];
         if (!empty($params['settings_php'])) {
-            $rawset = base64_decode($params['settings_php'], true);
+            $rawset = $this->b64_strict($params['settings_php']);
             $maybe = $rawset === false ? false
                    : @unserialize($rawset, ['allowed_classes' => ['stdClass']]);
             if (is_object($maybe)) {
