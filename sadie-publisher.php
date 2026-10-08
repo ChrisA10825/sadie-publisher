@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.5
+ * Version: 3.2.6
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,11 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.2.6 - /publish and /publish/{id} accept optional `parent` (page id, 0 clears)
+ *         and `template` (page template file, 'default' clears). Pages only;
+ *         the parent must be an existing page that is not the post itself, the
+ *         template must exist in the active theme. Lets pages be created under
+ *         a parent without core REST (hosts that strip the Authorization header).
  * 3.2.5 - Same code as 3.2.4 plus the b64_strict() change below. 3.2.4 is
  *         burned (its zip was rejected by the 3.1.7 scan).
  * 3.2.4 - New /theme-file endpoint: list, read and write files in the
@@ -2481,6 +2486,14 @@ class Sadie_Publisher {
         if (!empty($params['slug'])) {
             $post_data['post_name'] = sanitize_title($params['slug']);
         }
+        $hier = $this->page_hierarchy_args($params, $post_type, 0);
+        if (is_wp_error($hier)) {
+            $this->audit_log('publish', false, $ip, $hier->get_error_message());
+            return $hier;
+        }
+        if (array_key_exists('post_parent', $hier)) {
+            $post_data['post_parent'] = $hier['post_parent'];
+        }
         if (!empty($params['excerpt'])) {
             $post_data['post_excerpt'] = sanitize_textarea_field($params['excerpt']);
         }
@@ -2501,6 +2514,10 @@ class Sadie_Publisher {
 
         // Builder-specific post meta
         $this->set_builder_meta($post_id, $builder, $params);
+
+        if (isset($hier['template'])) {
+            update_post_meta($post_id, '_wp_page_template', $hier['template']);
+        }
 
         // Categories
         if (!empty($params['categories'])) {
@@ -2613,6 +2630,15 @@ class Sadie_Publisher {
             }
         }
 
+        $hier = $this->page_hierarchy_args($params, $post->post_type, $post_id);
+        if (is_wp_error($hier)) {
+            $this->audit_log('update', false, $ip, $hier->get_error_message());
+            return $hier;
+        }
+        if (array_key_exists('post_parent', $hier)) {
+            $post_data['post_parent'] = $hier['post_parent'];
+        }
+
         // WordPress requires edit_date=true to actually change post_date on updates
         if (!empty($params['date'])) {
             $post_data['edit_date'] = true;
@@ -2622,6 +2648,10 @@ class Sadie_Publisher {
         if (is_wp_error($result)) {
             $this->audit_log('update', false, $ip, $result->get_error_message());
             return $result;
+        }
+
+        if (isset($hier['template'])) {
+            update_post_meta($post_id, '_wp_page_template', $hier['template']);
         }
 
         // Update SEO if provided
@@ -3385,6 +3415,53 @@ class Sadie_Publisher {
         }
 
         return implode("\n\n", $blocks);
+    }
+
+    /**
+     * v3.2.6: validate optional `parent` and `template` for pages.
+     * Returns [] when neither was sent, ['post_parent' => int, 'template' => string]
+     * for what was sent and valid, or WP_Error (400) when a value is invalid.
+     * Never silently ignores a bad value: a wrong parent changes the live URL.
+     */
+    private function page_hierarchy_args($params, $post_type, $self_id) {
+        $out = [];
+        $has_parent = is_array($params) && array_key_exists('parent', $params);
+        $has_template = is_array($params) && array_key_exists('template', $params);
+        if (!$has_parent && !$has_template) {
+            return $out;
+        }
+        if ($post_type !== 'page') {
+            return new WP_Error('bad_request', 'parent and template apply to pages only.', ['status' => 400]);
+        }
+        if ($has_parent) {
+            $parent = absint($params['parent']);
+            if ($parent > 0) {
+                $p = get_post($parent);
+                if (!$p || $p->post_type !== 'page') {
+                    return new WP_Error('bad_request', "parent {$parent} is not an existing page.", ['status' => 400]);
+                }
+                if ($self_id && $parent === (int) $self_id) {
+                    return new WP_Error('bad_request', 'A page cannot be its own parent.', ['status' => 400]);
+                }
+                if ($self_id && in_array((int) $self_id, array_map('intval', get_post_ancestors($parent)), true)) {
+                    return new WP_Error('bad_request', 'parent would create a loop.', ['status' => 400]);
+                }
+            }
+            $out['post_parent'] = $parent;
+        }
+        if ($has_template) {
+            $tpl = sanitize_text_field((string) $params['template']);
+            if ($tpl !== '' && $tpl !== 'default') {
+                $templates = wp_get_theme()->get_page_templates(null, 'page');
+                if (!isset($templates[$tpl])) {
+                    return new WP_Error('bad_request', "template '{$tpl}' does not exist in the active theme.", ['status' => 400]);
+                }
+            } else {
+                $tpl = 'default';
+            }
+            $out['template'] = $tpl;
+        }
+        return $out;
     }
 
     private function set_builder_meta($post_id, $builder, $params) {
