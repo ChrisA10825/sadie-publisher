@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.7
+ * Version: 3.2.8
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,10 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.2.8 - /redirections matches an existing rule by its DECODED pattern + comparison
+ *         (Rank Math UI rows serialize keys in another order, so the old byte match on
+ *         `sources` created duplicates), accepts an optional `id` to update one exact row,
+ *         reports any other rows with the same source, and no longer resets hits on update.
  * 3.2.7 - Same code as 3.2.6 with SADIE_PUBLISHER_VERSION bumped to match the
  *         header (3.2.6 shipped with the constant still at 3.2.5, so /ping misreported).
  * 3.2.6 - /publish and /publish/{id} accept optional `parent` (page id, 0 clears)
@@ -314,7 +318,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.2.7');
+define('SADIE_PUBLISHER_VERSION', '3.2.8');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -1664,17 +1668,43 @@ class Sadie_Publisher {
             'ignore'     => '',
         ]]);
 
-        // Check for existing redirection with this source (by serialized blob match)
-        $existing_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$table} WHERE sources = %s LIMIT 1",
-            $sources_serialized
-        ));
+        // v3.2.8: match existing rules by DECODED pattern + comparison. Rows created in
+        // the Rank Math UI serialize their keys in a different order, so the old byte
+        // match on `sources` missed them and inserted duplicates.
+        $want_id = isset($params['id']) ? absint($params['id']) : 0;
+        $matches = [];
+        $like = '%' . $wpdb->esc_like($source_pattern) . '%';
+        $cands = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, sources FROM {$table} WHERE sources LIKE %s ORDER BY id ASC",
+            $like
+        ), ARRAY_A);
+        foreach ((array) $cands as $c) {
+            $dec = maybe_unserialize($c['sources']);
+            if (!is_array($dec)) {
+                continue;
+            }
+            foreach ($dec as $src) {
+                if (is_array($src) && isset($src['pattern']) && $src['pattern'] === $source_pattern
+                    && ($src['comparison'] ?? 'exact') === $comparison) {
+                    $matches[] = (int) $c['id'];
+                    break;
+                }
+            }
+        }
+        if ($want_id) {
+            if (!in_array($want_id, $matches, true)) {
+                return new WP_Error('bad_request', "Redirection id {$want_id} does not have source '{$source_pattern}' ({$comparison}).", ['status' => 400]);
+            }
+            $existing_id = $want_id;
+        } else {
+            $existing_id = $matches ? $matches[0] : 0;
+        }
+        $duplicates = array_values(array_diff($matches, [(int) $existing_id]));
 
         $row = [
             'sources'      => $sources_serialized,
             'url_to'       => esc_url_raw($target),
             'header_code'  => $code,
-            'hits'         => 0,
             'status'       => $status,
             'updated'      => current_time('mysql'),
         ];
@@ -1685,6 +1715,7 @@ class Sadie_Publisher {
             $rid = (int) $existing_id;
         } else {
             $row['created'] = current_time('mysql');
+            $row['hits'] = 0;
             $wpdb->insert($table, $row);
             $action = 'created';
             $rid = (int) $wpdb->insert_id;
@@ -1710,6 +1741,7 @@ class Sadie_Publisher {
             'header_code'=> $code,
             'comparison' => $comparison,
             'status'     => $status,
+            'duplicates' => $duplicates,
         ], 200);
     }
 
