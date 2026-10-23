@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.8
+ * Version: 3.2.9
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,18 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.2.9 - Human-edit guard [wp-human-edit-guard-01]. PUT /publish/{id}, POST /headings and
+ *         POST /fl-builder refuse with 409 + diff when the caller sends X-Sadie-Last-Write
+ *         (ISO 8601 or unix seconds, GMT) and a revision by a non-Sadie user that changed
+ *         title, content or excerpt is newer than that time. X-Sadie-Force: <Christian's
+ *         words> overrides and is audit-logged. Sadie authors = user 0 (API) plus the
+ *         `sadie_user_logins` setting (default sadie, devbseo, brotherlyseo), extendable
+ *         per request with X-Sadie-Users. New GET /revisions/{id} (revision list with
+ *         author login and raw fields, plus the guard verdict for ?since=). Every
+ *         publish/update stamps _sadie_last_write_gmt and returns modified_gmt and
+ *         content_sha256 so callers can keep a write ledger. X-Sadie-Strict: 1 counts
+ *         every author as "other" (for callers like BCC that regenerate from a stored
+ *         copy). Callers that send no X-Sadie-Last-Write behave exactly as in 3.2.8.
  * 3.2.8 - /redirections matches an existing rule by its DECODED pattern + comparison
  *         (Rank Math UI rows serialize keys in another order, so the old byte match on
  *         `sources` created duplicates), accepts an optional `id` to update one exact row,
@@ -318,7 +330,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.2.8');
+define('SADIE_PUBLISHER_VERSION', '3.2.9');
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -910,6 +922,13 @@ class Sadie_Publisher {
         register_rest_route($ns, '/post-data/(?P<id>\d+)', [
             'methods' => 'GET',
             'callback' => [$this, 'handle_get_post_data'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.2.9: revision list + human-edit verdict [wp-human-edit-guard-01]
+        register_rest_route($ns, '/revisions/(?P<id>\d+)', [
+            'methods' => 'GET',
+            'callback' => [$this, 'handle_revisions'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
 
@@ -2603,6 +2622,7 @@ class Sadie_Publisher {
         update_post_meta($post_id, '_sadie_published_at', current_time('mysql'));
         update_post_meta($post_id, '_sadie_publisher_version', SADIE_PUBLISHER_VERSION);
         update_post_meta($post_id, '_sadie_builder', $builder['name']);
+        $this->stamp_last_write($post_id);
 
         $this->audit_log('publish', true, $ip, "Post #{$post_id}: " . $params['title']);
 
@@ -2610,14 +2630,14 @@ class Sadie_Publisher {
             $this->ping_indexnow(get_permalink($post_id));
         }
 
-        return new WP_REST_Response([
+        return new WP_REST_Response(array_merge([
             'success' => true,
             'post_id' => $post_id,
             'post_url' => get_permalink($post_id),
             'edit_url' => get_edit_post_link($post_id, 'raw'),
             'status' => get_post_status($post_id),
             'builder' => $builder['name'],
-        ], 201);
+        ], $this->write_receipt($post_id)), 201);
     }
 
     // =========================================================================
@@ -2633,6 +2653,14 @@ class Sadie_Publisher {
         if (!$post) {
             $this->audit_log('update', false, $ip, "Post #{$post_id} not found");
             return new WP_Error('not_found', 'Post not found.', ['status' => 404]);
+        }
+
+        // v3.2.9 human-edit guard [wp-human-edit-guard-01]
+        if (!empty($params['title']) || !empty($params['content']) || !empty($params['excerpt']) || !empty($params['elementor_data'])) {
+            $held = $this->human_edit_guard($request, $post_id, 'update');
+            if ($held) {
+                return $held;
+            }
         }
 
         $post_data = ['ID' => $post_id];
@@ -2767,6 +2795,11 @@ class Sadie_Publisher {
         }
 
         update_post_meta($post_id, '_sadie_updated_at', current_time('mysql'));
+        // Only a write of human-editable fields is "our last write"; a status/category/date-only
+        // update must not move the stamp past a human edit it never touched.
+        if (!empty($params['title']) || !empty($params['content']) || !empty($params['excerpt']) || !empty($params['elementor_data'])) {
+            $this->stamp_last_write($post_id);
+        }
 
         $this->audit_log('update', true, $ip, "Post #{$post_id}");
 
@@ -2774,12 +2807,12 @@ class Sadie_Publisher {
             $this->ping_indexnow(get_permalink($post_id));
         }
 
-        return new WP_REST_Response([
+        return new WP_REST_Response(array_merge([
             'success' => true,
             'post_id' => $post_id,
             'post_url' => get_permalink($post_id),
             'status' => get_post_status($post_id),
-        ], 200);
+        ], $this->write_receipt($post_id)), 200);
     }
 
     // =========================================================================
@@ -2811,6 +2844,263 @@ class Sadie_Publisher {
             'elementor_data' => $elementor_data,
             'elementor_mode' => get_post_meta($post_id, '_elementor_edit_mode', true),
         ], 200);
+    }
+
+    // =========================================================================
+    // HUMAN-EDIT GUARD (v3.2.9) [wp-human-edit-guard-01]
+    // =========================================================================
+    // Born from Valley Accident Law post 7441: the attorney's 19 redlines made
+    // in wp-admin were silently reverted by a later API re-push. A revision by a
+    // real (non-Sadie) user that changed title/content/excerpt after our last
+    // write means a human edited the post; overwriting it would erase that.
+
+    private function sadie_user_logins($request = null) {
+        $settings = get_option($this->settings_option, []);
+        $raw = $settings['sadie_user_logins'] ?? 'sadie,devbseo,brotherlyseo';
+        $list = array_filter(array_map('trim', explode(',', strtolower((string) $raw))));
+        if ($request) {
+            $extra = (string) $request->get_header('X-Sadie-Users');
+            if ($extra !== '') {
+                $list = array_merge($list, array_filter(array_map('trim', explode(',', strtolower($extra)))));
+            }
+        }
+        return apply_filters('sadie_publisher_sadie_user_logins', array_values(array_unique($list)));
+    }
+
+    private function is_sadie_author($author_id, $logins) {
+        $author_id = (int) $author_id;
+        if ($author_id === 0) {
+            return true;
+        }
+        $u = get_userdata($author_id);
+        if (!$u) {
+            return false;
+        }
+        return in_array(strtolower($u->user_login), $logins, true);
+    }
+
+    private function parse_gmt_ts($value) {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return null;
+        }
+        if (ctype_digit($value)) {
+            return (int) $value;
+        }
+        $ts = strtotime($value . (preg_match('/(Z|[+-]\d\d:?\d\d)$/', $value) ? '' : ' UTC'));
+        return $ts === false ? null : $ts;
+    }
+
+    private static function norm_field($text) {
+        $text = html_entity_decode((string) $text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $smart = [];
+        foreach (['&#8216;' => "'", '&#8217;' => "'", '&#8220;' => '"', '&#8221;' => '"', '&#160;' => ' '] as $ent => $plain) {
+            $smart[html_entity_decode($ent, ENT_QUOTES | ENT_HTML5, 'UTF-8')] = $plain;
+        }
+        $text = strtr($text, $smart);
+        return trim(preg_replace('/\s+/u', ' ', $text));
+    }
+
+    private static function plain_lines($html) {
+        $html = preg_replace('#<(/p|br\s*/?|/h[1-6]|/li|/tr|/blockquote|/div)>#i', "$0\n", (string) $html);
+        $text = wp_strip_all_tags($html, false);
+        $lines = [];
+        foreach (preg_split('/\n+/', $text) as $line) {
+            $line = self::norm_field($line);
+            if ($line !== '') {
+                $lines[] = $line;
+            }
+        }
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Ordered revision rows (oldest first) with authorship and changed fields.
+     * Autosaves are excluded: they are unsaved drafts, not the live post.
+     */
+    private function last_write_snapshot($post_id) {
+        $snap = get_post_meta($post_id, '_sadie_last_write_snapshot', true);
+        $snap = is_string($snap) ? json_decode($snap, true) : null;
+        if (!is_array($snap)) {
+            return null;
+        }
+        return (object) [
+            'ID' => 'snapshot',
+            'post_title' => (string) ($snap['title'] ?? ''),
+            'post_content' => (string) ($snap['content'] ?? ''),
+            'post_excerpt' => (string) ($snap['excerpt'] ?? ''),
+        ];
+    }
+
+    private function revision_rows($post_id, $logins, $with_bodies) {
+        $revs = wp_get_post_revisions($post_id, ['order' => 'ASC', 'orderby' => 'date ID', 'posts_per_page' => 200]);
+        $rows = [];
+        // A plugin publish creates no revision, so the first revision's "before" is our snapshot.
+        $prev = $this->last_write_snapshot($post_id);
+        foreach ($revs as $rev) {
+            if (wp_is_post_autosave($rev)) {
+                continue;
+            }
+            $changed = [];
+            foreach (['post_title' => 'title', 'post_content' => 'content', 'post_excerpt' => 'excerpt'] as $f => $label) {
+                if ($prev === null || self::norm_field($prev->$f) !== self::norm_field($rev->$f)) {
+                    $changed[] = $label;
+                }
+            }
+            $u = get_userdata((int) $rev->post_author);
+            $row = [
+                'id' => (int) $rev->ID,
+                'author' => (int) $rev->post_author,
+                'author_login' => $u ? $u->user_login : ((int) $rev->post_author === 0 ? '(api)' : '(deleted)'),
+                'author_name' => $u ? $u->display_name : '',
+                'date_gmt' => mysql2date('Y-m-d\TH:i:s', $rev->post_modified_gmt, false),
+                'is_sadie' => $this->is_sadie_author($rev->post_author, $logins),
+                'changed' => $changed,
+            ];
+            if ($with_bodies) {
+                $row['title'] = $rev->post_title;
+                $row['content'] = $rev->post_content;
+                $row['excerpt'] = $rev->post_excerpt;
+            }
+            $rows[] = $row;
+            $prev = $rev;
+        }
+        return $rows;
+    }
+
+    /**
+     * Verdict for "has a human edited this since $since_ts?". Returns
+     * ['held' => bool, 'human_revisions' => [...], 'base_revision' => id|null].
+     */
+    private function human_edit_verdict($post_id, $since_ts, $logins, $strict = false) {
+        $rows = $this->revision_rows($post_id, $logins, false);
+        if ($strict) {
+            // Strict (X-Sadie-Strict: 1): the caller regenerates from its own stored copy (BCC),
+            // so ANY change after its last write, by anyone, is something that copy lacks.
+            foreach ($rows as &$sr) {
+                $sr['is_sadie'] = false;
+            }
+            unset($sr);
+        }
+        $human = [];
+        $base = null;
+        foreach ($rows as $r) {
+            $ts = strtotime($r['date_gmt'] . ' UTC');
+            if ($ts <= $since_ts) {
+                $base = $r['id'];
+                continue;
+            }
+            if (!$r['is_sadie'] && !empty($r['changed'])) {
+                $human[] = $r;
+            } elseif (empty($human)) {
+                $base = $r['id'];
+            }
+        }
+        return ['held' => !empty($human), 'human_revisions' => $human, 'base_revision' => $base];
+    }
+
+    private function human_edit_guard($request, $post_id, $action) {
+        $since = $this->parse_gmt_ts($request->get_header('X-Sadie-Last-Write'));
+        if ($since === null) {
+            return null; // caller opted out (pre-3.2.9 behaviour); the caller-side check still applies
+        }
+        $ip = $this->get_client_ip();
+        $force = trim((string) $request->get_header('X-Sadie-Force'));
+        $logins = $this->sadie_user_logins($request);
+        $strict = trim((string) $request->get_header('X-Sadie-Strict')) === '1';
+        $v = $this->human_edit_verdict($post_id, $since, $logins, $strict);
+        if (!$v['held']) {
+            return null;
+        }
+        if (strlen($force) >= 8) {
+            $this->audit_log('human_edit_force', true, $ip, "Post #{$post_id} {$action}: " . substr($force, 0, 200));
+            return null;
+        }
+        $current = get_post($post_id);
+        $base = $v['base_revision'] ? get_post($v['base_revision']) : null;
+        $snap = $this->last_write_snapshot($post_id);
+        if (!$base && $snap) {
+            $base = $snap;
+        }
+        $diff_html = '';
+        if ($base && $current) {
+            $diff_html = (string) wp_text_diff(self::plain_lines($base->post_content), self::plain_lines($current->post_content), [
+                'title_left' => 'Sadie last write (revision ' . $base->ID . ')',
+                'title_right' => 'Live now',
+            ]);
+            if (self::norm_field($base->post_title) !== self::norm_field($current->post_title)) {
+                $diff_html = '<p>Title: ' . esc_html($base->post_title) . ' &rarr; ' . esc_html($current->post_title) . '</p>' . $diff_html;
+            }
+        }
+        $this->audit_log('human_edit_hold', false, $ip, "Post #{$post_id} {$action}: " . count($v['human_revisions']) . ' human revision(s)');
+        return new WP_Error('held_human_edit', 'held: human edit. A non-Sadie user changed this post after your last write; refusing to overwrite.', [
+            'status' => 409,
+            'held' => true,
+            'post_id' => (int) $post_id,
+            'since_gmt' => gmdate('Y-m-d\TH:i:s', $since),
+            'base_revision' => $v['base_revision'],
+            'human_revisions' => $v['human_revisions'],
+            'diff_html' => $diff_html,
+        ]);
+    }
+
+    public function handle_revisions($request) {
+        $post_id = absint($request->get_param('id'));
+        $post = get_post($post_id);
+        if (!$post || $post->post_type === 'revision') {
+            return new WP_Error('not_found', 'Post not found.', ['status' => 404]);
+        }
+        $logins = $this->sadie_user_logins($request);
+        $with_bodies = $request->get_param('bodies') !== '0';
+        $out = [
+            'success' => true,
+            'plugin_version' => SADIE_PUBLISHER_VERSION,
+            'post' => [
+                'id' => $post_id,
+                'type' => $post->post_type,
+                'status' => $post->post_status,
+                'modified_gmt' => mysql2date('Y-m-d\TH:i:s', $post->post_modified_gmt, false),
+                'title' => $post->post_title,
+                'content' => $with_bodies ? $post->post_content : null,
+                'excerpt' => $post->post_excerpt,
+                'content_sha256' => hash('sha256', $post->post_content),
+                'sadie_last_write_gmt' => get_post_meta($post_id, '_sadie_last_write_gmt', true) ?: null,
+            ],
+            'sadie_user_logins' => $logins,
+            'revisions' => $this->revision_rows($post_id, $logins, $with_bodies),
+        ];
+        $since = $this->parse_gmt_ts($request->get_param('since'));
+        if ($since !== null) {
+            $out['verdict'] = $this->human_edit_verdict($post_id, $since, $logins);
+        }
+        return new WP_REST_Response($out, 200);
+    }
+
+    private function stamp_last_write($post_id) {
+        clean_post_cache($post_id);
+        $p = get_post($post_id);
+        update_post_meta($post_id, '_sadie_last_write_gmt', gmdate('Y-m-d\TH:i:s'));
+        if ($p) {
+            // What we left behind, so a later human edit can be diffed against it (wp_slash: meta API unslashes).
+            update_post_meta($post_id, '_sadie_last_write_snapshot', wp_slash(wp_json_encode([
+                'title' => $p->post_title,
+                'content' => $p->post_content,
+                'excerpt' => $p->post_excerpt,
+            ])));
+        }
+    }
+
+    private function write_receipt($post_id) {
+        clean_post_cache($post_id);
+        $p = get_post($post_id);
+        if (!$p) {
+            return [];
+        }
+        return [
+            'modified_gmt' => mysql2date('Y-m-d\TH:i:s', $p->post_modified_gmt, false),
+            'content_sha256' => hash('sha256', $p->post_content),
+            'plugin_version' => SADIE_PUBLISHER_VERSION,
+        ];
     }
 
     // =========================================================================
@@ -3820,6 +4110,10 @@ class Sadie_Publisher {
             return $post;
         }
         $post_id = $post->ID;
+        $held = $this->human_edit_guard($request, $post_id, 'fl_builder');
+        if ($held) {
+            return $held;
+        }
 
         // PREFERRED PATH: layout_php, base64 of a PHP-serialized array.
         //
@@ -4169,6 +4463,10 @@ class Sadie_Publisher {
         $post = $this->resolve_post($body);
         if (is_wp_error($post)) {
             return $post;
+        }
+        $held = $this->human_edit_guard($request, $post->ID, 'headings');
+        if ($held) {
+            return $held;
         }
 
         $updated = [];
