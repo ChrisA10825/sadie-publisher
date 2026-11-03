@@ -3,7 +3,7 @@
  * Plugin Name: Sadie Publisher
  * Plugin URI: https://brotherlyseo.com
  * Description: Sadie's on-site agent. Content publishing, SEO meta management, internal-link injection, page-state probe, and operational monitoring for Brotherly SEO clients.
- * Version: 3.2.9
+ * Version: 3.3.0
  * Author: Brotherly SEO
  * License: GPL v2 or later
  * Text Domain: sadie-publisher
@@ -11,6 +11,20 @@
  * Requires at least: 5.8
  *
  * Changelog:
+ * 3.3.0 - Security: /options locked to exact allowlists [sp-options-allowlist-01]
+ *         (decision 656a9132, 2026-11-02). GET /options returns only a short read
+ *         allowlist (the option names the fleet's scripts and skills actually read);
+ *         sadie_publisher_api_key is returned MASKED. Any other key: 403 with the
+ *         rejected names, nothing read. POST /options drops the sadie_* prefix
+ *         wildcard (it let a key holder write sadie_theme_file_backups, a code
+ *         restore primitive) and accepts only an exact write list. The API key is
+ *         no longer writable through /options at all. New POST /rotate-key sets a
+ *         new key (caller-supplied sadie_ + 64 hex, or generated server side and
+ *         returned once) and keeps the previous key valid for a grace window
+ *         (default 600 s, max 600) so a caller can confirm the new key before the
+ *         old one dies; {action:"end_grace"} with the NEW key ends it early. A
+ *         grace-window key authenticates normally but cannot call /rotate-key.
+ *         Regenerating the key in wp-admin clears any grace key.
  * 3.2.9 - Human-edit guard [wp-human-edit-guard-01]. PUT /publish/{id}, POST /headings and
  *         POST /fl-builder refuse with 409 + diff when the caller sends X-Sadie-Last-Write
  *         (ISO 8601 or unix seconds, GMT) and a revision by a non-Sadie user that changed
@@ -330,7 +344,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('SADIE_PUBLISHER_VERSION', '3.2.9');
+define('SADIE_PUBLISHER_VERSION', '3.3.0');
+define('SADIE_PUBLISHER_KEY_GRACE', 600); // v3.3.0: seconds the previous key stays valid after /rotate-key
 define('SADIE_PUBLISHER_MIN_PHP', '7.4');
 define('SADIE_PUBLISHER_RATE_LIMIT', 30); // requests per minute
 define('SADIE_PUBLISHER_NONCE_TTL', 300); // 5 minute nonce window
@@ -347,6 +362,10 @@ class Sadie_Publisher {
     private $project_token_option = 'sadie_publisher_project_token';
     private $settings_option = 'sadie_publisher_settings';
     private $log_option = 'sadie_publisher_audit_log';
+    // v3.3.0: previous API key kept valid for a short grace window after /rotate-key.
+    private $prev_key_option = 'sadie_publisher_api_key_prev';
+    // v3.3.0: true when the current request authenticated with the grace-window key.
+    private $auth_via_grace = false;
 
     public static function get_instance() {
         if (null === self::$instance) {
@@ -915,6 +934,13 @@ class Sadie_Publisher {
         register_rest_route($ns, '/options', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_options_set'],
+            'permission_callback' => [$this, 'verify_request'],
+        ]);
+
+        // v3.3.0: API key rotation with a grace window (the only remote way to set the key)
+        register_rest_route($ns, '/rotate-key', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_rotate_key'],
             'permission_callback' => [$this, 'verify_request'],
         ]);
 
@@ -1985,6 +2011,7 @@ class Sadie_Publisher {
 
     public function verify_request($request) {
         $ip = $this->get_client_ip();
+        $this->auth_via_grace = false;
 
         // 1. Rate limiting
         if ($this->is_rate_limited($ip)) {
@@ -2008,7 +2035,21 @@ class Sadie_Publisher {
 
         $stored_key = get_option($this->api_key_option);
 
-        if (!$provided_key || !$stored_key || !hash_equals($stored_key, $provided_key)) {
+        // v3.3.0: the key that authenticated this request. Normally the current
+        // key; during a /rotate-key grace window the previous key is accepted too,
+        // and it is then also the HMAC secret for this request.
+        $auth_key = null;
+        if ($provided_key && $stored_key && hash_equals($stored_key, $provided_key)) {
+            $auth_key = $stored_key;
+        } elseif ($provided_key && is_string($provided_key)) {
+            $prev_key = $this->grace_previous_key();
+            if ($prev_key !== '' && hash_equals($prev_key, $provided_key)) {
+                $auth_key = $prev_key;
+                $this->auth_via_grace = true;
+            }
+        }
+
+        if ($auth_key === null) {
             $this->audit_log('auth_fail', false, $ip, 'Invalid API key');
             return new WP_Error('unauthorized', 'Invalid API key.', ['status' => 401]);
         }
@@ -2056,7 +2097,7 @@ class Sadie_Publisher {
             $method = $request->get_method();
             $path = $request->get_route();
             $payload = $timestamp . $method . $path . $body;
-            $expected = hash_hmac('sha256', $payload, $stored_key);
+            $expected = hash_hmac('sha256', $payload, $auth_key);
 
             if (!hash_equals($expected, $signature)) {
                 $this->audit_log('auth_fail', false, $ip, 'Invalid HMAC signature');
@@ -2074,18 +2115,73 @@ class Sadie_Publisher {
     // ENDPOINT: WP OPTIONS READ/WRITE
     // =========================================================================
 
+    /**
+     * v3.3.0 read allowlist [sp-options-allowlist-01]. Before 3.3.0, GET /options
+     * returned ANY wp_options row to a key holder, including the API key itself
+     * and third-party secrets (SMTP passwords, payment and API keys). This list is
+     * exactly the option names our own scripts and skills read, found by grepping
+     * every caller on 2026-11-02. Add a name here only with a real caller.
+     * Returns [sanitized request name => real option name].
+     */
+    private function options_read_allowlist() {
+        $names = [
+            'sadie_publisher_settings',   // plugin config (seo_plugin pin, hmac, ips)
+            'sadie_publisher_api_key',    // returned MASKED, see handle_options_get
+            'blogdescription',            // tagline
+            'rank-math-options-titles',   // Rank Math titles/meta diagnostics
+            'rank-math-options-sitemap',  // Rank Math sitemap diagnostics
+            'ez-toc-settings',            // Easy TOC heading levels (rea)
+        ];
+        $map = [];
+        foreach ($names as $n) {
+            $map[sanitize_key($n)] = $n;
+        }
+        // Active theme mods only (Customizer custom_css_post_id lookup), never
+        // another theme's mods.
+        $stylesheet = get_stylesheet();
+        if ($stylesheet) {
+            $map[sanitize_key('theme_mods_' . $stylesheet)] = 'theme_mods_' . $stylesheet;
+        }
+        return $map;
+    }
+
     public function handle_options_get($request) {
         $ip = $this->get_client_ip();
         $keys = $request->get_param('keys');
         if (empty($keys) || !is_array($keys)) {
             return new WP_Error('bad_request', 'keys[] parameter required.', ['status' => 400]);
         }
-        $result = [];
+        $allowed = $this->options_read_allowlist();
+        $wanted = [];
+        $rejected = [];
         foreach ($keys as $key) {
-            $key = sanitize_key($key);
-            if ($key) {
-                $result[$key] = get_option($key);
+            $key = sanitize_key(is_string($key) ? $key : '');
+            if (!$key) continue;
+            if (isset($allowed[$key])) {
+                $wanted[$key] = $allowed[$key];
+            } else {
+                $rejected[] = $key;
             }
+        }
+        // Any non-allowlisted name refuses the whole request: nothing is read.
+        if (!empty($rejected)) {
+            $this->audit_log('options_get', false, $ip, 'rejected=' . implode(',', $rejected));
+            return new WP_REST_Response([
+                'code'     => 'option_not_allowed',
+                'message'  => 'One or more option names are not on the read allowlist.',
+                'rejected' => $rejected,
+            ], 403);
+        }
+        if (empty($wanted)) {
+            return new WP_Error('bad_request', 'keys[] parameter required.', ['status' => 400]);
+        }
+        $result = [];
+        foreach ($wanted as $key => $real) {
+            $val = get_option($real);
+            if ($real === $this->api_key_option) {
+                $val = $this->mask_secret($val);
+            }
+            $result[$key] = $val;
         }
         $this->audit_log('options_get', true, $ip, implode(',', array_keys($result)));
         return new WP_REST_Response($result, 200);
@@ -2106,16 +2202,18 @@ class Sadie_Publisher {
      * toggle remotely. Everything else → 403.
      */
     private function options_set_allowlist() {
+        // v3.3.0: exact names only, taken from real callers (2026-11-02 grep).
+        // The sadie_* prefix wildcard is GONE: it let a key holder write
+        // sadie_theme_file_backups (a theme-file restore source) and every other
+        // plugin-internal option. sadie_publisher_api_key is set only through
+        // POST /rotate-key. sadie_publisher_project_token and blogdescription
+        // had no remote writer and were dropped.
         return [
-            'sadie_publisher_settings',
-            'sadie_publisher_api_key',
-            'sadie_publisher_project_token',
-            // SEO meta descriptions / titles are handled through /publish,
-            // never raw options. So no theme-ish keys listed here.
-            'blogdescription',        // tagline — benign
+            'sadie_publisher_settings',   // seo_plugin pin fix (travelbughealth 2026-07-29)
+            'sadie_tbh_vacc_plural_off',  // travelbughealth vaccine-URL kill switch
             // Explicitly NOT allowed: siteurl, home, template, stylesheet,
             // active_plugins, default_role, users_can_register, admin_email,
-            // mailserver_*, * anything we haven't whitelisted.
+            // mailserver_*, any sadie_* internal, anything not listed above.
         ];
     }
 
@@ -2134,11 +2232,15 @@ class Sadie_Publisher {
             $key = sanitize_key($key);
             if (!$key) continue;
 
-            // Allow exact match OR sadie_* prefix (any plugin-owned namespace).
-            $is_allowed = in_array($key, $allowed, true)
-                || strpos($key, 'sadie_') === 0;
-            if (!$is_allowed) {
+            // v3.3.0: exact match only.
+            if (!in_array($key, $allowed, true)) {
                 $rejected[] = $key;
+                continue;
+            }
+            // The settings array is read with array access everywhere; a scalar
+            // here would silently disable HMAC and the IP allowlist.
+            if ($key === $this->settings_option && !is_array($value)) {
+                $failed[] = $key;
                 continue;
             }
 
@@ -2166,9 +2268,106 @@ class Sadie_Publisher {
             'failed'   => $failed,
             'rejected' => $rejected,
         ];
+        if (in_array($this->api_key_option, $rejected, true)) {
+            $resp['hint'] = 'The API key is set only through POST /sadie-publisher/v1/rotate-key.';
+        }
         // 403 if the caller tried ONLY disallowed keys (intent-to-abuse signal)
         $status = (empty($updated) && !empty($rejected)) ? 403 : 200;
         return new WP_REST_Response($resp, $status);
+    }
+
+    // =========================================================================
+    // ENDPOINT: ROTATE API KEY (v3.3.0)
+    // =========================================================================
+
+    /** Previous key if a grace window is open, else '' (expired windows are cleared). */
+    private function grace_previous_key() {
+        $prev = get_option($this->prev_key_option);
+        if (!is_array($prev) || empty($prev['key']) || !is_string($prev['key'])) {
+            return '';
+        }
+        if (empty($prev['expires']) || time() > (int) $prev['expires']) {
+            delete_option($this->prev_key_option);
+            return '';
+        }
+        return $prev['key'];
+    }
+
+    /**
+     * POST /rotate-key
+     *   {"action":"rotate", "new_key":"sadie_<64 hex>" (optional), "grace_seconds":600 (optional, 0..600)}
+     *   {"action":"end_grace"}  (call with the NEW key to kill the old one now)
+     * Must authenticate with the CURRENT key; a grace-window key is refused.
+     * When new_key is omitted the key is generated here and returned once.
+     */
+    public function handle_rotate_key($request) {
+        $ip = $this->get_client_ip();
+        if ($this->auth_via_grace) {
+            $this->audit_log('rotate_key', false, $ip, 'Refused: authenticated with grace-window key');
+            return new WP_Error('forbidden', 'rotate-key requires the current API key, not a grace-window key.', ['status' => 403]);
+        }
+        $params = $request->get_json_params();
+        if (!is_array($params)) {
+            $params = [];
+        }
+        $action = isset($params['action']) ? (string) $params['action'] : 'rotate';
+
+        if ($action === 'end_grace') {
+            $had = $this->grace_previous_key() !== '';
+            delete_option($this->prev_key_option);
+            $this->audit_log('rotate_key', true, $ip, 'Grace window ended early (had_grace=' . ($had ? 1 : 0) . ')');
+            return new WP_REST_Response(['success' => true, 'action' => 'end_grace', 'had_grace' => $had], 200);
+        }
+        if ($action !== 'rotate') {
+            return new WP_Error('bad_request', 'action must be rotate or end_grace.', ['status' => 400]);
+        }
+
+        $current = (string) get_option($this->api_key_option);
+        $generated = false;
+        $new = isset($params['new_key']) ? $params['new_key'] : '';
+        if ($new === '' || $new === null) {
+            $new = $this->generate_api_key();
+            $generated = true;
+        } elseif (!is_string($new) || !preg_match('/^sadie_[0-9a-f]{64}$/', $new)) {
+            return new WP_Error('bad_request', 'new_key must be sadie_ followed by 64 lowercase hex characters.', ['status' => 400]);
+        }
+        if ($current !== '' && hash_equals($current, $new)) {
+            return new WP_Error('bad_request', 'new_key equals the current key.', ['status' => 400]);
+        }
+
+        $grace = isset($params['grace_seconds']) ? (int) $params['grace_seconds'] : SADIE_PUBLISHER_KEY_GRACE;
+        $grace = max(0, min(SADIE_PUBLISHER_KEY_GRACE, $grace));
+        $expires = time() + $grace;
+
+        if ($grace > 0 && $current !== '') {
+            update_option($this->prev_key_option, ['key' => $current, 'expires' => $expires, 'rotated_at' => time()], false);
+        } else {
+            delete_option($this->prev_key_option);
+        }
+        update_option($this->api_key_option, $new);
+
+        if (get_option($this->api_key_option) !== $new) {
+            // Write did not stick: put the old key back and close the window.
+            update_option($this->api_key_option, $current);
+            delete_option($this->prev_key_option);
+            $this->audit_log('rotate_key', false, $ip, 'Key write did not read back; current key kept');
+            return new WP_Error('server_error', 'Key write did not read back. Current key unchanged.', ['status' => 500]);
+        }
+
+        $this->audit_log('rotate_key', true, $ip, 'Key rotated (grace=' . $grace . 's, generated=' . ($generated ? 1 : 0) . ')');
+        $resp = [
+            'success'        => true,
+            'action'         => 'rotate',
+            'grace_seconds'  => $grace,
+            'grace_expires'  => $grace > 0 ? gmdate('c', $expires) : null,
+            'new_key_sha256' => hash('sha256', $new),
+        ];
+        if ($generated) {
+            $resp['new_key'] = $new; // returned once, never stored anywhere readable
+        }
+        $response = new WP_REST_Response($resp, 200);
+        $response->header('Cache-Control', 'no-store, private');
+        return $response;
     }
 
     // =========================================================================
@@ -5218,6 +5417,8 @@ add_action('wp_ajax_sadie_regenerate_key', function() {
     } else {
         $new_key = 'sadie_' . bin2hex(random_bytes(32));
         update_option('sadie_publisher_api_key', $new_key);
+        // v3.3.0: an admin regenerate is a deliberate revoke, so no grace key survives it.
+        delete_option('sadie_publisher_api_key_prev');
     }
 
     // v3.0.11 — return only the masked form to the UI. The raw value is
